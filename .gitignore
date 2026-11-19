@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Data / Logs
+*.csv
+!python_model/sample_measurements.csv
+logs/
+
+# Arduino / PlatformIO
+.pio/
+build/
+*.hex
+*.elf
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.vscode/

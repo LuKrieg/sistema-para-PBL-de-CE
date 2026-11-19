@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>POWERGuard · Monitor en Vivo de Factor de Potencia</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo-dot"></div>
+      <div>
+        <h1>POWERGuard</h1>
+        <p class="subtitle">Compensador Automático de Factor de Potencia · Equipo 12 (KEY Institute)</p>
+      </div>
+    </div>
+    <div class="controls">
+      <span id="conn-badge" class="badge badge-off">Desconectado</span>
+      <button id="btn-connect" class="btn btn-primary">Conectar Arduino (USB)</button>
+      <button id="btn-sim" class="btn btn-secondary">Modo Simulación</button>
+      <button id="btn-export" class="btn btn-outline">Exportar CSV</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- Gauge Principal de FP -->
+    <section class="card card-gauge">
+      <div class="card-header">
+        <h2>Factor de Potencia (FP)</h2>
+        <span id="status-pill" class="pill">LISTO</span>
+      </div>
+      <div class="gauge-wrap">
+        <svg viewBox="0 0 240 140" class="gauge-svg" aria-label="Medidor de Factor de Potencia">
+          <!-- Arco base -->
+          <path d="M 20 120 A 100 100 0 0 1 220 120" fill="none" stroke="#1e293b" stroke-width="18" stroke-linecap="round" />
+          <!-- Zona objetivo 0.95 - 0.99 -->
+          <path d="M 208 75 A 100 100 0 0 1 220 116" fill="none" stroke="#10b981" stroke-width="18" stroke-linecap="round" opacity="0.35" />
+          <!-- Arco activo -->
+          <path id="gauge-arc" d="M 20 120 A 100 100 0 0 1 20 120" fill="none" stroke="#38bdf8" stroke-width="18" stroke-linecap="round" />
+        </svg>
+        <div class="gauge-value">
+          <span id="val-fp">0.000</span>
+          <small>Meta: 0.950 – 0.990</small>
+        </div>
+      </div>
+      <div class="mode-bar">
+        <span>Modo de control:</span>
+        <div class="btn-group">
+          <button id="btn-auto" class="btn-mode active">AUTO</button>
+          <button id="btn-manual" class="btn-mode">MANUAL</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Métricas Eléctricas -->
+    <section class="card card-kpis">
+      <div class="card-header">
+        <h2>Magnitudes Eléctricas (120 V / 60 Hz)</h2>
+        <span id="sample-count" class="muted">0 muestras</span>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi">
+          <span class="kpi-label">Tensión RMS (V)</span>
+          <strong id="val-vrms" class="kpi-val">0.0 V</strong>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Corriente RMS (I)</span>
+          <strong id="val-irms" class="kpi-val">0.00 A</strong>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Potencia Activa (P)</span>
+          <strong id="val-p" class="kpi-val">0.0 W</strong>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Potencia Reactiva (Q)</span>
+          <strong id="val-q" class="kpi-val">0.0 var</strong>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Potencia Aparente (S)</span>
+          <strong id="val-s" class="kpi-val">0.0 VA</strong>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Capacitancia Activa</span>
+          <strong id="val-cap" class="kpi-val">0.0 µF</strong>
+        </div>
+      </div>
+    </section>
+
+    <!-- Banco de Capacitores (4 Pasos por Relés) -->
+    <section class="card card-bank">
+      <div class="card-header">
+        <h2>Banco de Capacitores (4 Pasos · Conmutación por Relés)</h2>
+        <span class="muted">Bloqueo RC: 100 kΩ</span>
+      </div>
+      <div class="steps-grid" id="steps-container">
+        <!-- Generado dinámicamente por app.js -->
+      </div>
+    </section>
+
+    <!-- Gráfica en Tiempo Real -->
+    <section class="card card-chart">
+      <div class="card-header">
+        <h2>Tendencia en Tiempo Real (FP y Corriente)</h2>
+        <div class="legend">
+          <span class="leg-fp">● FP</span>
+          <span class="leg-i">● Irms (A)</span>
+          <span class="leg-target">--- Meta 0.95–0.99</span>
+        </div>
+      </div>
+      <canvas id="live-chart" width="820" height="240"></canvas>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
