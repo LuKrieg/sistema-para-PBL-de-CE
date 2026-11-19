@@ -10,13 +10,6 @@
 
 **POWERGuard** es un sistema monofásico de **120 V / 60 Hz** diseñado para medir en tiempo real el factor de potencia (FP) verdadero de un **motor monofásico WEG de 0.5 HP** y mantenerlo automáticamente dentro del rango objetivo de **0.95 a 0.99** mediante la conexión y desconexión controlada de un **banco de capacitores de 4 pasos (J1–J4)**.
 
-### Cambio respecto a la propuesta inicial (Semana 14)
-En la propuesta escrita se contemplaban optotriacs `MOC3031` y triacs `BTA16`/`BTA26-H` para conmutar cada paso del banco. En la implementación final **se retiraron los MOC3031 y triacs**, sustituyéndolos por **conmutación mediante relés (módulo de 4 canales optoacoplado / relés de potencia)** comandados directamente desde pines digitales del Arduino Nano.  
-El firmware mantiene toda la lógica de protección:
-- Tiempo mínimo de espera entre maniobras para evitar oscilaciones (*chattering*).
-- **Bloqueo de reconexión por descarga**: ningún paso vuelve a conectarse hasta que haya transcurrido su tiempo de descarga segura a través de la resistencia $R = 100\,\text{k}\Omega$.
-- Verificación de dirección de compensación (detecta sobrecompensación aunque $|FP| = P/(V_{rms} I_{rms})$ no distinga adelanto de atraso).
-
 ---
 
 ## 2. Estructura del repositorio
