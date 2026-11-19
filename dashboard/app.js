@@ -1,6 +1,7 @@
 // POWERGuard - Lógica del Dashboard en Vivo (Web Serial API + Simulador)
 
-const STEP_CAPACITANCES = [11.0, 23.5, 47.0, 47.0]; // uF por paso (J1..J4)
+const STEP_CAPACITANCES = [22.0, 47.0, 69.0]; // uF por paso (D12, D11, D10)
+const STEP_PINS_LABEL = ["D12", "D11", "D10"];
 const MAX_HISTORY = 80;
 
 let serialPort = null;
@@ -13,8 +14,8 @@ let recordedRows = [];
 // Estado de simulación local
 const simState = {
   t: 0,
-  steps: [0, 0, 0, 0],
-  lockedUntil: [0, 0, 0, 0],
+  steps: [0, 0, 0],
+  lockedUntil: [0, 0, 0],
   lastSwitchT: -10,
   awaitingCheck: false,
   lastAdded: -1,
@@ -42,17 +43,17 @@ const elStepsContainer = document.getElementById("steps-container");
 const canvas = document.getElementById("live-chart");
 const ctx = canvas.getContext("2d");
 
-// Inicializar tarjetas de los 4 pasos
-function renderStepCards(steps = [0, 0, 0, 0], lockedMs = [0, 0, 0, 0]) {
+// Inicializar tarjetas de los 3 pasos
+function renderStepCards(steps = [0, 0, 0], lockedMs = [0, 0, 0]) {
   elStepsContainer.innerHTML = "";
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < STEP_CAPACITANCES.length; i++) {
     const isOn = steps[i] === 1;
     const lockSec = (lockedMs[i] || 0) / 1000;
     const card = document.createElement("div");
     card.className = `step-card ${isOn ? "on" : ""}`;
     card.innerHTML = `
       <div class="step-top">
-        <span class="step-title">Paso J${i + 1}</span>
+        <span class="step-title">Paso ${i + 1} (${STEP_PINS_LABEL[i]})</span>
         <span class="step-state ${isOn ? "on" : "off"}">${isOn ? "CONECTADO" : "APAGADO"}</span>
       </div>
       <div class="step-cap">Capacitancia: <strong>${STEP_CAPACITANCES[i].toFixed(1)} µF</strong></div>
@@ -160,7 +161,7 @@ function handleTelemetry(data) {
     elBtnManual.classList.toggle("active", currentMode === "MANUAL");
   }
 
-  renderStepCards(data.steps || [0, 0, 0, 0], data.locked || [0, 0, 0, 0]);
+  renderStepCards(data.steps || [0, 0, 0], data.locked || [0, 0, 0]);
 
   history.push({ fp: data.fp || 0, irms: data.irms || 0 });
   if (history.length > MAX_HISTORY) history.shift();
@@ -175,7 +176,7 @@ function handleTelemetry(data) {
     s_va: (data.s || 0).toFixed(1),
     fp_measured: (data.fp || 0).toFixed(4),
     cap_uf: (data.cap_uf || 0).toFixed(1),
-    steps: (data.steps || [0, 0, 0, 0]).join(""),
+    steps: (data.steps || [0, 0, 0]).join(""),
     status: data.status || "",
   });
   elSampleCount.textContent = `${recordedRows.length} muestras`;
@@ -294,7 +295,7 @@ function runSimulationTick() {
       }
       simState.lastAdded = -1;
     } else if (fp < 0.95) {
-      const avail = [0, 1, 2, 3].filter((i) => simState.steps[i] === 0 && simState.t >= simState.lockedUntil[i]);
+      const avail = [0, 1, 2].filter((i) => simState.steps[i] === 0 && simState.t >= simState.lockedUntil[i]);
       if (avail.length > 0) {
         avail.sort((a, b) => STEP_CAPACITANCES[a] - STEP_CAPACITANCES[b]);
         const idx = avail[0];
@@ -306,7 +307,7 @@ function runSimulationTick() {
         status = "STEP_ADDED";
       }
     } else if (fp > 0.99) {
-      const active = [0, 1, 2, 3].filter((i) => simState.steps[i] === 1);
+      const active = [0, 1, 2].filter((i) => simState.steps[i] === 1);
       if (active.length > 0) {
         active.sort((a, b) => STEP_CAPACITANCES[a] - STEP_CAPACITANCES[b]);
         const idx = active[0];

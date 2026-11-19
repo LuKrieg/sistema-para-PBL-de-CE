@@ -41,7 +41,6 @@ CSV_HEADERS = [
     "step_1",
     "step_2",
     "step_3",
-    "step_4",
     "status",
 ]
 
@@ -51,8 +50,9 @@ class PowerGuardSimulator:
 
     def __init__(self, steps_uf=DEFAULT_BANK_STEPS_UF):
         self.steps_uf = list(steps_uf)
-        self.step_state = [0, 0, 0, 0]
-        self.last_disconnect_t = [0.0, 0.0, 0.0, 0.0]
+        self.num_steps = len(self.steps_uf)
+        self.step_state = [0] * self.num_steps
+        self.last_disconnect_t = [0.0] * self.num_steps
         self.last_switch_t = -10.0
         self.awaiting_check = False
         self.last_added_step = -1
@@ -88,7 +88,7 @@ class PowerGuardSimulator:
                 self.last_added_step = -1
             elif fp_meas < 0.95:
                 avail = [
-                    i for i in range(4)
+                    i for i in range(self.num_steps)
                     if self.step_state[i] == 0 and (t_sec - self.last_disconnect_t[i] >= 6.0 or self.last_disconnect_t[i] == 0.0)
                 ]
                 if avail:
@@ -102,7 +102,7 @@ class PowerGuardSimulator:
                 else:
                     self.status = "MAX_CAP_OR_LOCKED"
             elif fp_meas > 0.99:
-                active = [i for i in range(4) if self.step_state[i] == 1]
+                active = [i for i in range(self.num_steps) if self.step_state[i] == 1]
                 if active:
                     rem = min(active, key=lambda i: self.steps_uf[i])
                     self.step_state[rem] = 0
@@ -132,7 +132,6 @@ class PowerGuardSimulator:
             "step_1": self.step_state[0],
             "step_2": self.step_state[1],
             "step_3": self.step_state[2],
-            "step_4": self.step_state[3],
             "status": self.status,
         }
 
@@ -149,7 +148,7 @@ def run_simulation(duration_s: float, interval_s: float, log_path: Optional[Path
             f"[{row['timestamp_s']:>5.1f}s] Carga={row['load_pct']:>3}% | "
             f"V={row['vrms']:>6.2f}V I={row['irms']:>5.2f}A | "
             f"FP={row['fp_measured']:.3f} (mod={row['fp_model']:.3f}, err={row['error_pct']:.2f}%) | "
-            f"C={row['cap_uf']:>4.1f}uF [{row['step_1']}{row['step_2']}{row['step_3']}{row['step_4']}] {row['status']}"
+            f"C={row['cap_uf']:>4.1f}uF [{row['step_1']}{row['step_2']}{row['step_3']}] {row['status']}"
         )
         t += interval_s
         if interval_s > 0 and duration_s > 0:
@@ -201,7 +200,6 @@ def run_serial_reader(port: str, baud: int, log_path: Optional[Path]) -> None:
                     "step_1": steps[0] if len(steps) > 0 else 0,
                     "step_2": steps[1] if len(steps) > 1 else 0,
                     "step_3": steps[2] if len(steps) > 2 else 0,
-                    "step_4": steps[3] if len(steps) > 3 else 0,
                     "status": data.get("status", ""),
                 }
                 print(

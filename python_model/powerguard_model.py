@@ -23,10 +23,8 @@ DEFAULT_FP_TARGET = 0.95
 DEFAULT_FP_MAX = 0.99
 DEFAULT_DISCHARGE_R_OHMS = 100_000.0  # R9-R12 = 100 kOhm
 
-# Pasos recomendados del banco (uF) para cubrir hasta ~128.5 uF (0% a 100% carga del motor WEG 0.5 HP)
-# Nota: con 4x22uF y 4x47uF en pares opuestos se obtienen 69 uF; para alcanzar 0.95-0.99 a plena carga
-# con P_in real (626.9 W) se requieren ~120-129 uF (p. ej. agregando capacitores de marcha AC).
-DEFAULT_BANK_STEPS_UF: Tuple[float, float, float, float] = (11.0, 23.5, 47.0, 47.0)
+# Pasos del banco físico validado (3 pasos: 22 uF, 47 uF, 69 uF -> total 138 uF)
+DEFAULT_BANK_STEPS_UF: Tuple[float, float, float] = (22.0, 47.0, 69.0)
 
 
 @dataclass(frozen=True)
@@ -165,16 +163,16 @@ def time_to_safe_voltage(
 
 def simulate_all_bank_combinations(
     point: MotorOperatingPoint,
-    bank_steps_uf: Tuple[float, float, float, float] = DEFAULT_BANK_STEPS_UF,
+    bank_steps_uf: Tuple[float, ...] = DEFAULT_BANK_STEPS_UF,
     v_rms: float = DEFAULT_VOLTAGE_V,
     freq_hz: float = DEFAULT_FREQ_HZ,
 ) -> List[Dict[str, object]]:
     """
-    Predice el FP para cada una de las 16 combinaciones posibles (0000 a 1111)
-    del banco de 4 pasos en un punto de operación del motor.
+    Predice el FP para cada una de las 2^N combinaciones posibles (000 a 111)
+    del banco de capacitores en un punto de operación del motor.
     """
     results = []
-    for bits in product([0, 1], repeat=4):
+    for bits in product([0, 1], repeat=len(bank_steps_uf)):
         c_total = sum(b * c for b, c in zip(bits, bank_steps_uf))
         state = predict_compensated_state(point.p_in_w, point.fp_base, c_total, v_rms, freq_hz)
         in_range = (
@@ -214,7 +212,7 @@ def print_report() -> None:
         tau = DEFAULT_DISCHARGE_R_OHMS * c_uf * 1e-6
         print(f"  Paso J{idx} ({c_uf:>4.1f} uF): tau = {tau:.2f} s, t(<50V) = {t_safe:.2f} s")
 
-    print("\nCombinaciones válidas en rango [0.95, 0.99] (banco 11 / 23.5 / 23.5 / 47 uF):")
+    print("\nCombinaciones válidas en rango [0.95, 0.99] (banco 22 / 47 / 69 uF):")
     for pt in WEG_MOTOR_POINTS:
         combos = simulate_all_bank_combinations(pt)
         valid = [c for c in combos if c["en_rango_095_099"]]

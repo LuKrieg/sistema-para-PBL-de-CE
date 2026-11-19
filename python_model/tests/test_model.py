@@ -50,9 +50,9 @@ class TestPowerGuardModel(unittest.TestCase):
         err = measurement_error_pct(0.96, 0.98)
         self.assertAlmostEqual(err, (0.02 / 0.98) * 100.0, places=4)
 
-    def test_16_combinations_generated(self):
+    def test_bank_combinations_generated(self):
         combos = simulate_all_bank_combinations(WEG_MOTOR_POINTS[2])  # 50% carga
-        self.assertEqual(len(combos), 16)
+        self.assertEqual(len(combos), 8)
         # Debe existir al menos una combinación cercana o dentro de 0.95-0.99
         best = min(combos, key=lambda c: abs(c["FP_pred"] - 0.97))
         self.assertGreaterEqual(best["FP_pred"], 0.93)
