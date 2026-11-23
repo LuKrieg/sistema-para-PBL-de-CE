@@ -19,7 +19,7 @@
       <span id="conn-badge" class="badge badge-off">Desconectado</span>
       <button id="btn-connect" class="btn btn-primary">Conectar Arduino (USB)</button>
       <button id="btn-sim" class="btn btn-secondary">Modo Simulación</button>
-      <button id="btn-export" class="btn btn-outline">Exportar CSV</button>
+      <button id="btn-export" class="btn btn-outline">Exportar Prueba_1.csv</button>
     </div>
   </header>
 
@@ -109,6 +109,15 @@
         </div>
       </div>
       <canvas id="live-chart" width="820" height="240"></canvas>
+    </section>
+
+    <!-- Triángulo de Potencias en Vivo -->
+    <section class="card card-triangle">
+      <div class="card-header">
+        <h2>Triángulo de Potencias</h2>
+        <span id="triangle-angle" class="muted">φ = 0.0°</span>
+      </div>
+      <canvas id="triangle-chart" width="360" height="240"></canvas>
     </section>
   </main>
 

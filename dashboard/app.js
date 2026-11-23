@@ -40,8 +40,17 @@ const elValS = document.getElementById("val-s");
 const elValCap = document.getElementById("val-cap");
 const elSampleCount = document.getElementById("sample-count");
 const elStepsContainer = document.getElementById("steps-container");
+const elTriangleAngle = document.getElementById("triangle-angle");
 const canvas = document.getElementById("live-chart");
 const ctx = canvas.getContext("2d");
+const triCanvas = document.getElementById("triangle-chart");
+const triCtx = triCanvas.getContext("2d");
+
+let testCounter = parseInt(localStorage.getItem("powerguard_prueba_num") || "1", 10);
+function updateExportButtonLabel() {
+  elBtnExport.textContent = `Exportar Prueba_${testCounter}.csv`;
+}
+updateExportButtonLabel();
 
 // Inicializar tarjetas de los 3 pasos
 function renderStepCards(steps = [0, 0, 0], lockedMs = [0, 0, 0]) {
@@ -145,6 +154,80 @@ function drawChart() {
   ctx.fillText("0A", w - 30, padT + plotH);
 }
 
+function drawPowerTriangle(p, q, s, fp) {
+  const w = triCanvas.width;
+  const h = triCanvas.height;
+  triCtx.clearRect(0, 0, w, h);
+
+  const phiDeg = Math.acos(Math.max(0, Math.min(1, fp))) * (180 / Math.PI);
+  elTriangleAngle.textContent = `φ = ${phiDeg.toFixed(1)}°`;
+
+  const padL = 36, padR = 64, padT = 28, padB = 38;
+  const maxW = w - padL - padR;
+  const maxH = h - padT - padB;
+
+  if (s < 1.0) {
+    triCtx.fillStyle = "#9ca3af";
+    triCtx.font = "13px Segoe UI, sans-serif";
+    triCtx.fillText("Esperando carga...", w / 2 - 55, h / 2);
+    return;
+  }
+
+  const maxDim = Math.max(p, q, 1);
+  const scale = Math.min(maxW / maxDim, maxH / maxDim);
+  const px = Math.max(20, p * scale);
+  const qy = Math.max(4, q * scale);
+
+  const x0 = padL;
+  const y0 = h - padB;
+  const x1 = x0 + px;
+  const y1 = y0 - qy;
+
+  // Relleno sutil del triángulo
+  triCtx.fillStyle = "rgba(56, 189, 248, 0.08)";
+  triCtx.beginPath();
+  triCtx.moveTo(x0, y0);
+  triCtx.lineTo(x1, y0);
+  triCtx.lineTo(x1, y1);
+  triCtx.closePath();
+  triCtx.fill();
+
+  // Cateto P (Activa)
+  triCtx.strokeStyle = "#38bdf8";
+  triCtx.lineWidth = 3;
+  triCtx.beginPath();
+  triCtx.moveTo(x0, y0);
+  triCtx.lineTo(x1, y0);
+  triCtx.stroke();
+
+  // Cateto Q (Reactiva)
+  triCtx.strokeStyle = "#f59e0b";
+  triCtx.lineWidth = 3;
+  triCtx.beginPath();
+  triCtx.moveTo(x1, y0);
+  triCtx.lineTo(x1, y1);
+  triCtx.stroke();
+
+  // Hipotenusa S (Aparente)
+  triCtx.strokeStyle = fp >= 0.95 && fp <= 0.99 ? "#10b981" : "#e5e7eb";
+  triCtx.lineWidth = 3;
+  triCtx.beginPath();
+  triCtx.moveTo(x0, y0);
+  triCtx.lineTo(x1, y1);
+  triCtx.stroke();
+
+  // Etiquetas
+  triCtx.font = "12px Segoe UI, sans-serif";
+  triCtx.fillStyle = "#38bdf8";
+  triCtx.fillText(`P = ${p.toFixed(0)} W`, x0 + px * 0.3, y0 + 18);
+
+  triCtx.fillStyle = "#f59e0b";
+  triCtx.fillText(`Q = ${q.toFixed(0)} var`, x1 + 6, y0 - qy * 0.5);
+
+  triCtx.fillStyle = fp >= 0.95 && fp <= 0.99 ? "#10b981" : "#e5e7eb";
+  triCtx.fillText(`S = ${s.toFixed(0)} VA`, x0 + px * 0.25, y0 - qy * 0.55 - 6);
+}
+
 function handleTelemetry(data) {
   updateGauge(data.fp || 0);
   elValV.textContent = `${(data.vrms || 0).toFixed(1)} V`;
@@ -166,6 +249,7 @@ function handleTelemetry(data) {
   history.push({ fp: data.fp || 0, irms: data.irms || 0 });
   if (history.length > MAX_HISTORY) history.shift();
   drawChart();
+  drawPowerTriangle(data.p || 0, data.q || 0, data.s || 0, data.fp || 0);
 
   recordedRows.push({
     timestamp_s: ((data.t || Date.now()) / 1000).toFixed(2),
@@ -373,10 +457,15 @@ elBtnExport.addEventListener("click", () => {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `powerguard_mediciones_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`;
+  a.download = `Prueba_${testCounter}.csv`;
   a.click();
   URL.revokeObjectURL(url);
+
+  testCounter += 1;
+  localStorage.setItem("powerguard_prueba_num", String(testCounter));
+  updateExportButtonLabel();
 });
 
 renderStepCards();
 drawChart();
+drawPowerTriangle(0, 0, 0, 1);
