@@ -1,29 +1,36 @@
 /*
- * POWERGuard - Compensador Automático de Factor de Potencia
+ * POWERGuard - Medidor True-RMS/FP y Controlador de Banco de Capacitores
  * Equipo PowerGuard 12 | Circuitos Eléctricos | KEY Institute
  *
- * Versión validada en hardware (3 pasos en D12/D11/D10, ZMPT101B en A0 del Nano,
- * SCT-013 en ADS1115 diferencial A0-A1, buffers int16_t optimizados para 2 KB SRAM).
+ * - Sin librerías externas: habla con el ADS1115 directo por Wire (400 kHz).
+ * - ZMPT101B en ADS1115 A2 (single-ended) y SCT-013 en ADS1115 A0-A1 (diferencial).
+ * - 3 LEDs/pasos en D10, D11, D12 (activos en HIGH).
+ * - Comandos Serial (115200 baud):
+ *     1 / 2 / 3   -> alternar paso/LED D10 / D11 / D12 (pasa a modo MANUAL)
+ *     0           -> apagar todos los pasos/LEDs
+ *     l           -> repetir prueba visual de LEDs
+ *     MODE:AUTO   -> control automático (FP entre 0.95 y 0.99)
+ *     MODE:MANUAL -> control manual
+ *     STEP:i:v    -> activar (v=1) o desactivar (v=0) paso i (0..2)
+ *     STATUS      -> enviar lectura JSON inmediata
  */
 
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>
 #include "config.h"
 
-Adafruit_ADS1115 ads;
-
-bool stepState[NUM_STEPS] = {};
-unsigned long lastDisconnectMs[NUM_STEPS] = {};
-unsigned long dischargeLockoutMs[NUM_STEPS] = {};
+bool stepState[NUM_STEPS] = {false, false, false};
+unsigned long lastDisconnectMs[NUM_STEPS] = {0, 0, 0};
+unsigned long dischargeLockoutMs[NUM_STEPS] = {0, 0, 0};
 unsigned long lastSwitchMs = 0;
 
+bool adsPresente = false;
 bool autoMode = true;
 bool awaitingStepCheck = false;
 int8_t lastAddedStep = -1;
 float fpBeforeStep = 0.0f;
 const char* systemStatus = "INIT";
 
-// Buffers en int16_t (mitad de RAM que float)
+// Buffers en int16_t para cuidar la SRAM del Arduino Nano
 int16_t vRaw[MAX_SAMPLES];
 int16_t iRaw[MAX_SAMPLES];
 unsigned long vTimeUs[MAX_SAMPLES];
@@ -44,13 +51,60 @@ unsigned long lastTelemetryMs = 0;
 char serialCmdBuf[32];
 uint8_t serialCmdLen = 0;
 
+// ============================================================================
+// Comunicación directa con ADS1115 por I2C (Wire)
+// ============================================================================
+
+bool detectarADS() {
+  Wire.beginTransmission(ADS_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+bool adsWriteConfig(uint16_t cfg) {
+  Wire.beginTransmission(ADS_ADDR);
+  Wire.write((uint8_t)0x01);
+  Wire.write((uint8_t)(cfg >> 8));
+  Wire.write((uint8_t)(cfg & 0xFF));
+  return Wire.endTransmission() == 0;
+}
+
+bool adsReadReg(uint8_t reg, int16_t &valor) {
+  Wire.beginTransmission(ADS_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(ADS_ADDR, (uint8_t)2) != 2) return false;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  valor = (int16_t)(((uint16_t)hi << 8) | lo);
+  return true;
+}
+
+// mux: 0 = A0-A1 dif, 4..7 = A0..A3 contra GND (6 = A2)
+bool adsRead(uint8_t mux, int16_t &out) {
+  // OS=1 (iniciar), MUX, PGA +-4.096 V, single-shot, 860 SPS, comparador apagado
+  uint16_t cfg = 0x8000 | ((uint16_t)mux << 12) | 0x0200 | 0x0100 | 0x00E0 | 0x0003;
+  if (!adsWriteConfig(cfg)) return false;
+  delayMicroseconds(1200);
+  uint32_t t0 = millis();
+  int16_t c;
+  do {
+    if (!adsReadReg(0x01, c)) return false;
+    if (millis() - t0 > 20) return false;
+  } while (!((uint16_t)c & 0x8000));
+  return adsReadReg(0x00, out);
+}
+
+// ============================================================================
+// Control de LEDs / Pasos y bloqueo por descarga RC
+// ============================================================================
+
 unsigned long computeDischargeLockoutMs(float capacitanceUf) {
   float tauSeconds = DISCHARGE_RESISTOR_OHMS * (capacitanceUf * 1e-6f);
   unsigned long lockout = (unsigned long)(DISCHARGE_TAU_MULTIPLIER * tauSeconds * 1000.0f);
   return max(lockout, MIN_DISCHARGE_LOCKOUT_MS);
 }
 
-void writeRelayPin(uint8_t stepIdx, bool turnOn) {
+void writeStepPin(uint8_t stepIdx, bool turnOn) {
   if (stepIdx >= NUM_STEPS) return;
   uint8_t level = turnOn ? (RELAY_ACTIVE_LOW ? LOW : HIGH)
                          : (RELAY_ACTIVE_LOW ? HIGH : LOW);
@@ -65,16 +119,16 @@ unsigned long getRemainingLockoutMs(uint8_t stepIdx) {
   return dischargeLockoutMs[stepIdx] - elapsed;
 }
 
-bool setStepState(uint8_t stepIdx, bool turnOn) {
+bool setStepState(uint8_t stepIdx, bool turnOn, bool bypassLockout = false) {
   if (stepIdx >= NUM_STEPS) return false;
   if (stepState[stepIdx] == turnOn) return true;
   if (turnOn) {
-    if (getRemainingLockoutMs(stepIdx) > 0) return false;
+    if (!bypassLockout && getRemainingLockoutMs(stepIdx) > 0) return false;
     stepState[stepIdx] = true;
-    writeRelayPin(stepIdx, true);
+    writeStepPin(stepIdx, true);
   } else {
     stepState[stepIdx] = false;
-    writeRelayPin(stepIdx, false);
+    writeStepPin(stepIdx, false);
     lastDisconnectMs[stepIdx] = millis();
   }
   lastSwitchMs = millis();
@@ -89,17 +143,50 @@ float getTotalConnectedCapacitanceUf() {
   return total;
 }
 
+void pruebaLED() {
+  for (uint8_t i = 0; i < NUM_STEPS; i++) {
+    writeStepPin(i, true);
+    delay(400);
+    writeStepPin(i, false);
+    stepState[i] = false;
+  }
+  for (uint8_t i = 0; i < NUM_STEPS; i++) writeStepPin(i, true);
+  delay(400);
+  for (uint8_t i = 0; i < NUM_STEPS; i++) writeStepPin(i, false);
+}
+
+// ============================================================================
+// Medición True-RMS y Factor de Potencia
+// ============================================================================
+
 PowerMetrics measurePower() {
   PowerMetrics m = {0, 0, 0, 0, 0, 0, 0};
+  adsPresente = detectarADS();
+  if (!adsPresente) {
+    systemStatus = "ADS1115_ERROR";
+    return m;
+  }
+
   unsigned long startMs = millis();
   uint8_t n = 0;
 
   while ((millis() - startMs) < MEASUREMENT_WINDOW_MS && n < MAX_SAMPLES) {
+    int16_t rawV = 0, rawI = 0;
     vTimeUs[n] = micros();
-    vRaw[n] = (int16_t)analogRead(PIN_ZMPT);
+    if (!adsRead(MUX_ZMPT, rawV)) {
+      adsPresente = false;
+      systemStatus = "ADS1115_ERROR";
+      return m;
+    }
+    vRaw[n] = rawV;
 
     iTimeUs[n] = micros();
-    iRaw[n] = ads.readADC_Differential_0_1();
+    if (!adsRead(MUX_SCT_DIFF, rawI)) {
+      adsPresente = false;
+      systemStatus = "ADS1115_ERROR";
+      return m;
+    }
+    iRaw[n] = rawI;
     n++;
   }
 
@@ -113,7 +200,7 @@ PowerMetrics measurePower() {
   float offsetV = (float)sumV / n;
   float offsetI = (float)sumI / n;
 
-  float vScale = NANO_ADC_VOLTS * VOLTAGE_CAL_FACTOR;
+  float vScale = ADS_LSB_VOLTS * VOLTAGE_CAL_FACTOR;
   float iScale = ADS_LSB_VOLTS * CURRENT_CAL_FACTOR;
 
   double sumV2 = 0.0, sumI2 = 0.0, sumP = 0.0;
@@ -156,6 +243,10 @@ PowerMetrics measurePower() {
   return m;
 }
 
+// ============================================================================
+// Lógica de control automático (0.95 - 0.99)
+// ============================================================================
+
 int8_t findNextAvailableStepToAdd() {
   int8_t bestIdx = -1;
   float minCap = 1e9f;
@@ -181,7 +272,8 @@ int8_t findStepToRemove() {
 }
 
 void runAutoControl(const PowerMetrics &m) {
-  if (!autoMode) { systemStatus = "MANUAL"; return; }
+  if (!adsPresente) { systemStatus = "ADS1115_ERROR"; return; }
+  if (!autoMode)    { systemStatus = "MANUAL"; return; }
 
   if (m.irms < MIN_CURRENT_THRESHOLD_A) {
     bool anyOn = false;
@@ -234,6 +326,10 @@ void runAutoControl(const PowerMetrics &m) {
   }
 }
 
+// ============================================================================
+// Telemetría JSON y comandos por Serial
+// ============================================================================
+
 void sendTelemetry(const PowerMetrics &m) {
   Serial.print(F("{\"t\":"));       Serial.print(millis());
   Serial.print(F(",\"vrms\":"));   Serial.print(m.vrms, 2);
@@ -259,16 +355,29 @@ void sendTelemetry(const PowerMetrics &m) {
 }
 
 void processSerialCommand(const char* cmd) {
-  if (strcmp(cmd, "MODE:AUTO") == 0)        { autoMode = true;  awaitingStepCheck = false; }
-  else if (strcmp(cmd, "MODE:MANUAL") == 0) { autoMode = false; awaitingStepCheck = false; }
-  else if (strcmp(cmd, "STATUS") == 0)      { sendTelemetry(lastMetrics); }
-  else if (strncmp(cmd, "STEP:", 5) == 0) {
+  if (strcmp(cmd, "MODE:AUTO") == 0) {
+    autoMode = true;
+    awaitingStepCheck = false;
+  } else if (strcmp(cmd, "MODE:MANUAL") == 0) {
+    autoMode = false;
+    awaitingStepCheck = false;
+  } else if (strcmp(cmd, "STATUS") == 0) {
+    sendTelemetry(lastMetrics);
+  } else if (strcmp(cmd, "0") == 0) {
+    autoMode = false;
+    for (uint8_t i = 0; i < NUM_STEPS; i++) setStepState(i, false, true);
+  } else if (strcmp(cmd, "1") == 0 || strcmp(cmd, "2") == 0 || strcmp(cmd, "3") == 0) {
+    uint8_t idx = (uint8_t)(cmd[0] - '1');
+    autoMode = false;
+    setStepState(idx, !stepState[idx], true);
+  } else if (strcmp(cmd, "l") == 0 || strcmp(cmd, "L") == 0) {
+    autoMode = false;
+    pruebaLED();
+  } else if (strncmp(cmd, "STEP:", 5) == 0) {
     int idx = -1, val = 0;
-    if (sscanf(cmd, "STEP:%d:%d", &idx, &val) == 2) {
-      if (idx >= 0 && idx < NUM_STEPS) {
-        autoMode = false;
-        setStepState((uint8_t)idx, val == 1);
-      }
+    if (sscanf(cmd, "STEP:%d:%d", &idx, &val) == 2 && idx >= 0 && idx < NUM_STEPS) {
+      autoMode = false;
+      setStepState((uint8_t)idx, val == 1);
     }
   }
 }
@@ -288,20 +397,28 @@ void pollSerialCommands() {
   }
 }
 
+// ============================================================================
+// Setup y Loop principal
+// ============================================================================
+
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
-  Wire.begin();
   for (uint8_t i = 0; i < NUM_STEPS; i++) {
     pinMode(STEP_PINS[i], OUTPUT);
-    writeRelayPin(i, false);
+    writeStepPin(i, false);
     dischargeLockoutMs[i] = computeDischargeLockoutMs(STEP_CAPACITANCE_UF[i]);
   }
-  if (!ads.begin()) {
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  adsPresente = detectarADS();
+  pruebaLED();
+
+  if (!adsPresente) {
     systemStatus = "ADS1115_ERROR";
-    Serial.println(F("{\"error\":\"ADS1115 no detectado en I2C 0x48 (revisar SDA=A4, SCL=A5)\"}"));
+    Serial.println(F("{\"error\":\"ADS1115 no responde en 0x48 (revisar SDA->A4, SCL->A5)\"}"));
   } else {
-    ads.setGain(GAIN_ONE);
-    ads.setDataRate(RATE_ADS1115_860SPS);
     systemStatus = "READY";
   }
 }
