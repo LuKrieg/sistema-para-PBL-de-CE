@@ -1,118 +1,139 @@
 /*
- * POWERGuard - Medidor True-RMS/FP y Controlador de Banco de Capacitores
- * Equipo PowerGuard 12 | Circuitos Eléctricos | KEY Institute
+ * POWERGuard 12 - Medidor True-RMS / Factor de Potencia y Control Automático
+ * Basado en "Prueba de componentes v4.1 (circuito TAL COMO ESTA)"
  *
- * - Sin librerías externas: habla con el ADS1115 directo por Wire (400 kHz).
- * - ZMPT101B en ADS1115 A2 (single-ended) y SCT-013 en ADS1115 A0-A1 (diferencial).
- * - 3 LEDs/pasos en D10, D11, D12 (activos en HIGH).
- * - Comandos Serial (115200 baud):
- *     1 / 2 / 3   -> alternar paso/LED D10 / D11 / D12 (pasa a modo MANUAL)
- *     0           -> apagar todos los pasos/LEDs
- *     l           -> repetir prueba visual de LEDs
- *     MODE:AUTO   -> control automático (FP entre 0.95 y 0.99)
- *     MODE:MANUAL -> control manual
- *     STEP:i:v    -> activar (v=1) o desactivar (v=0) paso i (0..2)
- *     STATUS      -> enviar lectura JSON inmediata
+ * - I2C por software en A1 (SDA) y A2 (SCL), sin librerías externas.
+ * - ZMPT101B en A0 del Nano, SCT-013-000 en ADS1115 (A0-A1 diferencial continuo).
+ * - 3 pasos / LEDs en D12 (D1), D11 (D2), D10 (D3).
+ * - Calcula Vrms, Irms, P, Q, S, FP verdadero y frecuencia en tiempo real.
+ *
+ * Comandos Serial (115200 baud):
+ *   1 / 2 / 3   -> alternar paso/LED D1/D2/D3 (modo MANUAL)
+ *   0           -> apagar todos los pasos/LEDs
+ *   l           -> repetir prueba visual de LEDs
+ *   r           -> cambiar entre 5 y 10 lecturas por segundo
+ *   t           -> alternar salida JSON (Dashboard) / Tabla texto (Monitor Serie)
+ *   d           -> mostrar / ocultar detalle en mV (en modo tabla texto)
+ *   MODE:AUTO   -> control automático (FP entre 0.95 y 0.99)
+ *   MODE:MANUAL -> control manual
+ *   STEP:i:v    -> activar (v=1) o desactivar (v=0) paso i (0..2)
  */
 
-#include <Wire.h>
 #include "config.h"
 
-bool stepState[NUM_STEPS] = {false, false, false};
+uint8_t lecturasPorSeg = 5;   // 5 o 10 (comando 'r')
+uint8_t adsAddr = 0;          // 0 = no encontrado
+bool ledEstado[NUM_STEPS] = {false, false, false};
 unsigned long lastDisconnectMs[NUM_STEPS] = {0, 0, 0};
 unsigned long dischargeLockoutMs[NUM_STEPS] = {0, 0, 0};
 unsigned long lastSwitchMs = 0;
 
-bool adsPresente = false;
 bool autoMode = true;
 bool awaitingStepCheck = false;
 int8_t lastAddedStep = -1;
 float fpBeforeStep = 0.0f;
 const char* systemStatus = "INIT";
 
-// Buffers en int16_t para cuidar la SRAM del Arduino Nano
-int16_t vRaw[MAX_SAMPLES];
-int16_t iRaw[MAX_SAMPLES];
-unsigned long vTimeUs[MAX_SAMPLES];
-unsigned long iTimeUs[MAX_SAMPLES];
+bool jsonMode = true;         // true = JSON para Dashboard, false = tabla v4.1
+bool detalle = false;         // comando 'd'
+float mCuentas = 512.0f;      // media del ZMPT (en cuentas) de la ventana anterior
+uint32_t numero = 0;
 
-struct PowerMetrics {
-  float vrms;
-  float irms;
-  float p;
-  float q;
-  float s;
-  float fp;
-  uint8_t sampleCount;
-};
-
-PowerMetrics lastMetrics = {0, 0, 0, 0, 0, 0, 0};
-unsigned long lastTelemetryMs = 0;
 char serialCmdBuf[32];
 uint8_t serialCmdLen = 0;
 
-// ============================================================================
-// Comunicación directa con ADS1115 por I2C (Wire)
-// ============================================================================
-
-bool detectarADS() {
-  Wire.beginTransmission(ADS_ADDR);
-  return Wire.endTransmission() == 0;
+// ---------- I2C por software (solo bajar o soltar la línea) ----------
+inline void i2cDelay() { delayMicroseconds(5); }
+inline void sdaSoltar() { pinMode(SDA_PIN, INPUT); }
+inline void sdaBajar()  { pinMode(SDA_PIN, OUTPUT); }
+inline void sclBajar()  { pinMode(SCL_PIN, OUTPUT); i2cDelay(); }
+inline void sclSoltar() {
+  pinMode(SCL_PIN, INPUT);
+  uint16_t n = 0;
+  while (!digitalRead(SCL_PIN) && n++ < 500) delayMicroseconds(1);
+  i2cDelay();
 }
 
-bool adsWriteConfig(uint16_t cfg) {
-  Wire.beginTransmission(ADS_ADDR);
-  Wire.write((uint8_t)0x01);
-  Wire.write((uint8_t)(cfg >> 8));
-  Wire.write((uint8_t)(cfg & 0xFF));
-  return Wire.endTransmission() == 0;
+void i2cInicio() { sdaSoltar(); sclSoltar(); sdaBajar(); i2cDelay(); sclBajar(); }
+void i2cParada() { sdaBajar(); i2cDelay(); sclSoltar(); sdaSoltar(); i2cDelay(); }
+
+bool i2cEscribir(uint8_t b) {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (b & 0x80) sdaSoltar(); else sdaBajar();
+    i2cDelay(); sclSoltar(); sclBajar();
+    b <<= 1;
+  }
+  sdaSoltar(); i2cDelay(); sclSoltar();
+  bool ack = !digitalRead(SDA_PIN);
+  sclBajar();
+  return ack;
 }
 
-bool adsReadReg(uint8_t reg, int16_t &valor) {
-  Wire.beginTransmission(ADS_ADDR);
-  Wire.write(reg);
-  if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom(ADS_ADDR, (uint8_t)2) != 2) return false;
-  uint8_t hi = Wire.read();
-  uint8_t lo = Wire.read();
-  valor = (int16_t)(((uint16_t)hi << 8) | lo);
+uint8_t i2cLeer(bool ack) {
+  uint8_t b = 0;
+  sdaSoltar();
+  for (uint8_t i = 0; i < 8; i++) {
+    sclSoltar();
+    b = (b << 1) | (digitalRead(SDA_PIN) ? 1 : 0);
+    sclBajar();
+  }
+  if (ack) sdaBajar(); else sdaSoltar();
+  i2cDelay(); sclSoltar(); sclBajar();
+  sdaSoltar();
+  return b;
+}
+
+bool i2cProbar(uint8_t dir) {
+  i2cInicio();
+  bool ack = i2cEscribir(dir << 1);
+  i2cParada();
+  return ack;
+}
+
+// ---------- ADS1115 en modo continuo (A0-A1 diferencial, +-4.096 V, 860 SPS) ----------
+void buscarADS() {
+  adsAddr = 0;
+  for (uint8_t a = 0x48; a <= 0x4B; a++) {
+    if (i2cProbar(a)) { adsAddr = a; return; }
+  }
+}
+
+bool adsIniciarContinuo() {
+  i2cInicio();
+  bool ok = i2cEscribir(adsAddr << 1) && i2cEscribir(0x01) &&
+            i2cEscribir(0x02) && i2cEscribir(0xE3);
+  i2cParada();
+  if (!ok) return false;
+  i2cInicio();
+  ok = i2cEscribir(adsAddr << 1) && i2cEscribir(0x00);
+  i2cParada();
+  return ok;
+}
+
+bool adsLeerContinuo(int16_t &v) {
+  i2cInicio();
+  if (!i2cEscribir((adsAddr << 1) | 1)) { i2cParada(); return false; }
+  uint8_t hi = i2cLeer(true);
+  uint8_t lo = i2cLeer(false);
+  i2cParada();
+  v = (int16_t)(((uint16_t)hi << 8) | lo);
   return true;
 }
 
-// mux: 0 = A0-A1 dif, 4..7 = A0..A3 contra GND (6 = A2)
-bool adsRead(uint8_t mux, int16_t &out) {
-  // OS=1 (iniciar), MUX, PGA +-4.096 V, single-shot, 860 SPS, comparador apagado
-  uint16_t cfg = 0x8000 | ((uint16_t)mux << 12) | 0x0200 | 0x0100 | 0x00E0 | 0x0003;
-  if (!adsWriteConfig(cfg)) return false;
-  delayMicroseconds(1200);
-  uint32_t t0 = millis();
-  int16_t c;
-  do {
-    if (!adsReadReg(0x01, c)) return false;
-    if (millis() - t0 > 20) return false;
-  } while (!((uint16_t)c & 0x8000));
-  return adsReadReg(0x00, out);
+void iniciarADS() {
+  buscarADS();
+  if (adsAddr && !adsIniciarContinuo()) adsAddr = 0;
 }
 
-// ============================================================================
-// Control de LEDs / Pasos y bloqueo por descarga RC
-// ============================================================================
-
+// ---------- Control de LEDs / Pasos y bloqueo RC ----------
 unsigned long computeDischargeLockoutMs(float capacitanceUf) {
   float tauSeconds = DISCHARGE_RESISTOR_OHMS * (capacitanceUf * 1e-6f);
   unsigned long lockout = (unsigned long)(DISCHARGE_TAU_MULTIPLIER * tauSeconds * 1000.0f);
   return max(lockout, MIN_DISCHARGE_LOCKOUT_MS);
 }
 
-void writeStepPin(uint8_t stepIdx, bool turnOn) {
-  if (stepIdx >= NUM_STEPS) return;
-  uint8_t level = turnOn ? (RELAY_ACTIVE_LOW ? LOW : HIGH)
-                         : (RELAY_ACTIVE_LOW ? HIGH : LOW);
-  digitalWrite(STEP_PINS[stepIdx], level);
-}
-
 unsigned long getRemainingLockoutMs(uint8_t stepIdx) {
-  if (stepIdx >= NUM_STEPS || stepState[stepIdx]) return 0;
+  if (stepIdx >= NUM_STEPS || ledEstado[stepIdx]) return 0;
   if (lastDisconnectMs[stepIdx] == 0) return 0;
   unsigned long elapsed = millis() - lastDisconnectMs[stepIdx];
   if (elapsed >= dischargeLockoutMs[stepIdx]) return 0;
@@ -121,14 +142,14 @@ unsigned long getRemainingLockoutMs(uint8_t stepIdx) {
 
 bool setStepState(uint8_t stepIdx, bool turnOn, bool bypassLockout = false) {
   if (stepIdx >= NUM_STEPS) return false;
-  if (stepState[stepIdx] == turnOn) return true;
+  if (ledEstado[stepIdx] == turnOn) return true;
   if (turnOn) {
     if (!bypassLockout && getRemainingLockoutMs(stepIdx) > 0) return false;
-    stepState[stepIdx] = true;
-    writeStepPin(stepIdx, true);
+    ledEstado[stepIdx] = true;
+    digitalWrite(LED_PIN[stepIdx], RELAY_ACTIVE_LOW ? LOW : HIGH);
   } else {
-    stepState[stepIdx] = false;
-    writeStepPin(stepIdx, false);
+    ledEstado[stepIdx] = false;
+    digitalWrite(LED_PIN[stepIdx], RELAY_ACTIVE_LOW ? HIGH : LOW);
     lastDisconnectMs[stepIdx] = millis();
   }
   lastSwitchMs = millis();
@@ -138,120 +159,29 @@ bool setStepState(uint8_t stepIdx, bool turnOn, bool bypassLockout = false) {
 float getTotalConnectedCapacitanceUf() {
   float total = 0.0f;
   for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    if (stepState[i]) total += STEP_CAPACITANCE_UF[i];
+    if (ledEstado[i]) total += STEP_CAPACITANCE_UF[i];
   }
   return total;
 }
 
 void pruebaLED() {
   for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    writeStepPin(i, true);
+    digitalWrite(LED_PIN[i], HIGH);
     delay(400);
-    writeStepPin(i, false);
-    stepState[i] = false;
+    digitalWrite(LED_PIN[i], LOW);
+    ledEstado[i] = false;
   }
-  for (uint8_t i = 0; i < NUM_STEPS; i++) writeStepPin(i, true);
+  for (uint8_t i = 0; i < NUM_STEPS; i++) digitalWrite(LED_PIN[i], HIGH);
   delay(400);
-  for (uint8_t i = 0; i < NUM_STEPS; i++) writeStepPin(i, false);
+  for (uint8_t i = 0; i < NUM_STEPS; i++) digitalWrite(LED_PIN[i], LOW);
 }
 
-// ============================================================================
-// Medición True-RMS y Factor de Potencia
-// ============================================================================
-
-PowerMetrics measurePower() {
-  PowerMetrics m = {0, 0, 0, 0, 0, 0, 0};
-  adsPresente = detectarADS();
-  if (!adsPresente) {
-    systemStatus = "ADS1115_ERROR";
-    return m;
-  }
-
-  unsigned long startMs = millis();
-  uint8_t n = 0;
-
-  while ((millis() - startMs) < MEASUREMENT_WINDOW_MS && n < MAX_SAMPLES) {
-    int16_t rawV = 0, rawI = 0;
-    vTimeUs[n] = micros();
-    if (!adsRead(MUX_ZMPT, rawV)) {
-      adsPresente = false;
-      systemStatus = "ADS1115_ERROR";
-      return m;
-    }
-    vRaw[n] = rawV;
-
-    iTimeUs[n] = micros();
-    if (!adsRead(MUX_SCT_DIFF, rawI)) {
-      adsPresente = false;
-      systemStatus = "ADS1115_ERROR";
-      return m;
-    }
-    iRaw[n] = rawI;
-    n++;
-  }
-
-  if (n < 10) return m;
-
-  long sumV = 0, sumI = 0;
-  for (uint8_t k = 0; k < n; k++) {
-    sumV += vRaw[k];
-    sumI += iRaw[k];
-  }
-  float offsetV = (float)sumV / n;
-  float offsetI = (float)sumI / n;
-
-  float vScale = ADS_LSB_VOLTS * VOLTAGE_CAL_FACTOR;
-  float iScale = ADS_LSB_VOLTS * CURRENT_CAL_FACTOR;
-
-  double sumV2 = 0.0, sumI2 = 0.0, sumP = 0.0;
-  uint8_t validCount = n - 1;
-
-  for (uint8_t k = 0; k < validCount; k++) {
-    float v0 = ((float)vRaw[k] - offsetV) * vScale;
-    float v1 = ((float)vRaw[k + 1] - offsetV) * vScale;
-    float iVal = ((float)iRaw[k] - offsetI) * iScale;
-
-    unsigned long dtSpan = vTimeUs[k + 1] - vTimeUs[k];
-    float alpha = 0.5f;
-    if (dtSpan > 0) {
-      alpha = (float)(iTimeUs[k] - vTimeUs[k]) / (float)dtSpan + PHASE_TRIM_SAMPLES;
-      if (alpha < 0.0f) alpha = 0.0f;
-      if (alpha > 1.0f) alpha = 1.0f;
-    }
-
-    float vAligned = v0 + alpha * (v1 - v0);
-    sumV2 += (double)vAligned * (double)vAligned;
-    sumI2 += (double)iVal * (double)iVal;
-    sumP  += (double)vAligned * (double)iVal;
-  }
-
-  m.vrms = sqrt(sumV2 / validCount);
-  m.irms = sqrt(sumI2 / validCount);
-  m.p    = (float)(sumP / validCount);
-  m.s    = m.vrms * m.irms;
-  m.sampleCount = validCount;
-
-  if (m.irms < MIN_CURRENT_THRESHOLD_A || m.s < 1.0f) {
-    m.p = 0.0f; m.q = 0.0f; m.fp = 1.0f;
-  } else {
-    float pAbs = fabs(m.p);
-    if (pAbs > m.s) pAbs = m.s;
-    m.p  = pAbs;
-    m.q  = sqrt(max(0.0f, (m.s * m.s) - (m.p * m.p)));
-    m.fp = m.p / m.s;
-  }
-  return m;
-}
-
-// ============================================================================
-// Lógica de control automático (0.95 - 0.99)
-// ============================================================================
-
+// ---------- Lógica de control automático (0.95 - 0.99) ----------
 int8_t findNextAvailableStepToAdd() {
   int8_t bestIdx = -1;
   float minCap = 1e9f;
   for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    if (!stepState[i] && getRemainingLockoutMs(i) == 0 && STEP_CAPACITANCE_UF[i] < minCap) {
+    if (!ledEstado[i] && getRemainingLockoutMs(i) == 0 && STEP_CAPACITANCE_UF[i] < minCap) {
       minCap = STEP_CAPACITANCE_UF[i];
       bestIdx = (int8_t)i;
     }
@@ -263,7 +193,7 @@ int8_t findStepToRemove() {
   int8_t bestIdx = -1;
   float minCap = 1e9f;
   for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    if (stepState[i] && STEP_CAPACITANCE_UF[i] < minCap) {
+    if (ledEstado[i] && STEP_CAPACITANCE_UF[i] < minCap) {
       minCap = STEP_CAPACITANCE_UF[i];
       bestIdx = (int8_t)i;
     }
@@ -271,14 +201,14 @@ int8_t findStepToRemove() {
   return bestIdx;
 }
 
-void runAutoControl(const PowerMetrics &m) {
-  if (!adsPresente) { systemStatus = "ADS1115_ERROR"; return; }
-  if (!autoMode)    { systemStatus = "MANUAL"; return; }
+void runAutoControl(bool hayV, bool hayI, float fp) {
+  if (!adsAddr) { systemStatus = "ADS1115_ERROR"; return; }
+  if (!autoMode) { systemStatus = "MANUAL"; return; }
 
-  if (m.irms < MIN_CURRENT_THRESHOLD_A) {
+  if (!hayV || !hayI) {
     bool anyOn = false;
     for (uint8_t i = 0; i < NUM_STEPS; i++) {
-      if (stepState[i]) { setStepState(i, false); anyOn = true; }
+      if (ledEstado[i]) { setStepState(i, false); anyOn = true; }
     }
     awaitingStepCheck = false;
     systemStatus = anyOn ? "NO_LOAD_RESET" : "NO_LOAD";
@@ -292,7 +222,7 @@ void runAutoControl(const PowerMetrics &m) {
 
   if (awaitingStepCheck && lastAddedStep >= 0) {
     awaitingStepCheck = false;
-    if (m.fp < fpBeforeStep) {
+    if (fp < fpBeforeStep) {
       setStepState((uint8_t)lastAddedStep, false);
       lastAddedStep = -1;
       systemStatus = "OVERCOMP_REVERT";
@@ -301,10 +231,10 @@ void runAutoControl(const PowerMetrics &m) {
     lastAddedStep = -1;
   }
 
-  if (m.fp < FP_TARGET_MIN) {
+  if (fp < FP_TARGET_MIN) {
     int8_t nextStep = findNextAvailableStepToAdd();
     if (nextStep >= 0) {
-      fpBeforeStep = m.fp;
+      fpBeforeStep = fp;
       if (setStepState((uint8_t)nextStep, true)) {
         lastAddedStep = nextStep;
         awaitingStepCheck = true;
@@ -313,7 +243,7 @@ void runAutoControl(const PowerMetrics &m) {
     } else {
       systemStatus = "MAX_CAP_OR_LOCKED";
     }
-  } else if (m.fp > FP_TARGET_MAX) {
+  } else if (fp > FP_TARGET_MAX) {
     int8_t remStep = findStepToRemove();
     if (remStep >= 0) {
       setStepState((uint8_t)remStep, false);
@@ -326,53 +256,30 @@ void runAutoControl(const PowerMetrics &m) {
   }
 }
 
-// ============================================================================
-// Telemetría JSON y comandos por Serial
-// ============================================================================
-
-void sendTelemetry(const PowerMetrics &m) {
-  Serial.print(F("{\"t\":"));       Serial.print(millis());
-  Serial.print(F(",\"vrms\":"));   Serial.print(m.vrms, 2);
-  Serial.print(F(",\"irms\":"));   Serial.print(m.irms, 3);
-  Serial.print(F(",\"p\":"));      Serial.print(m.p, 1);
-  Serial.print(F(",\"q\":"));      Serial.print(m.q, 1);
-  Serial.print(F(",\"s\":"));      Serial.print(m.s, 1);
-  Serial.print(F(",\"fp\":"));     Serial.print(m.fp, 3);
-  Serial.print(F(",\"steps\":["));
-  for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    Serial.print(stepState[i] ? 1 : 0);
-    if (i < NUM_STEPS - 1) Serial.print(',');
-  }
-  Serial.print(F("],\"locked\":["));
-  for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    Serial.print(getRemainingLockoutMs(i));
-    if (i < NUM_STEPS - 1) Serial.print(',');
-  }
-  Serial.print(F("],\"cap_uf\":")); Serial.print(getTotalConnectedCapacitanceUf(), 1);
-  Serial.print(F(",\"mode\":\""));  Serial.print(autoMode ? F("AUTO") : F("MANUAL"));
-  Serial.print(F("\",\"status\":\"")); Serial.print(systemStatus);
-  Serial.println(F("\"}"));
-}
-
-void processSerialCommand(const char* cmd) {
+// ---------- Comandos Serial ----------
+void processCommand(const char* cmd) {
   if (strcmp(cmd, "MODE:AUTO") == 0) {
     autoMode = true;
     awaitingStepCheck = false;
   } else if (strcmp(cmd, "MODE:MANUAL") == 0) {
     autoMode = false;
     awaitingStepCheck = false;
-  } else if (strcmp(cmd, "STATUS") == 0) {
-    sendTelemetry(lastMetrics);
   } else if (strcmp(cmd, "0") == 0) {
     autoMode = false;
     for (uint8_t i = 0; i < NUM_STEPS; i++) setStepState(i, false, true);
   } else if (strcmp(cmd, "1") == 0 || strcmp(cmd, "2") == 0 || strcmp(cmd, "3") == 0) {
     uint8_t idx = (uint8_t)(cmd[0] - '1');
     autoMode = false;
-    setStepState(idx, !stepState[idx], true);
+    setStepState(idx, !ledEstado[idx], true);
   } else if (strcmp(cmd, "l") == 0 || strcmp(cmd, "L") == 0) {
     autoMode = false;
     pruebaLED();
+  } else if (strcmp(cmd, "r") == 0 || strcmp(cmd, "R") == 0) {
+    lecturasPorSeg = (lecturasPorSeg == 5) ? 10 : 5;
+  } else if (strcmp(cmd, "d") == 0 || strcmp(cmd, "D") == 0) {
+    detalle = !detalle;
+  } else if (strcmp(cmd, "t") == 0 || strcmp(cmd, "T") == 0) {
+    jsonMode = !jsonMode;
   } else if (strncmp(cmd, "STEP:", 5) == 0) {
     int idx = -1, val = 0;
     if (sscanf(cmd, "STEP:%d:%d", &idx, &val) == 2 && idx >= 0 && idx < NUM_STEPS) {
@@ -382,13 +289,21 @@ void processSerialCommand(const char* cmd) {
   }
 }
 
-void pollSerialCommands() {
-  while (Serial.available() > 0) {
+void comandos() {
+  while (Serial.available()) {
     char c = (char)Serial.read();
+    // Soporte inmediato de comandos de 1 carácter cuando llegan sueltos desde Monitor Serie
+    if (serialCmdLen == 0 && (c == '0' || c == '1' || c == '2' || c == '3' ||
+        c == 'l' || c == 'L' || c == 'r' || c == 'R' || c == 'd' || c == 'D' ||
+        c == 't' || c == 'T')) {
+      char single[2] = {c, '\0'};
+      processCommand(single);
+      continue;
+    }
     if (c == '\n' || c == '\r') {
       if (serialCmdLen > 0) {
         serialCmdBuf[serialCmdLen] = '\0';
-        processSerialCommand(serialCmdBuf);
+        processCommand(serialCmdBuf);
         serialCmdLen = 0;
       }
     } else if (serialCmdLen < sizeof(serialCmdBuf) - 1) {
@@ -397,38 +312,183 @@ void pollSerialCommands() {
   }
 }
 
-// ============================================================================
-// Setup y Loop principal
-// ============================================================================
+void pf(float v, uint8_t ancho, uint8_t dec) {
+  char buf[14];
+  dtostrf(v, ancho, dec, buf);
+  Serial.print(buf);
+}
 
+// ---------- Programa ----------
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
   for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    pinMode(STEP_PINS[i], OUTPUT);
-    writeStepPin(i, false);
+    pinMode(LED_PIN[i], OUTPUT);
+    digitalWrite(LED_PIN[i], LOW);
     dischargeLockoutMs[i] = computeDischargeLockoutMs(STEP_CAPACITANCE_UF[i]);
   }
 
-  Wire.begin();
-  Wire.setClock(400000);
+  pinMode(SDA_PIN, INPUT); digitalWrite(SDA_PIN, LOW);
+  pinMode(SCL_PIN, INPUT); digitalWrite(SCL_PIN, LOW);
 
-  adsPresente = detectarADS();
+  iniciarADS();
   pruebaLED();
 
-  if (!adsPresente) {
+  if (!adsAddr) {
     systemStatus = "ADS1115_ERROR";
-    Serial.println(F("{\"error\":\"ADS1115 no responde en 0x48 (revisar SDA->A4, SCL->A5)\"}"));
+    Serial.println(F("{\"error\":\"ADS1115 no responde en A1(SDA)/A2(SCL)\"}"));
   } else {
     systemStatus = "READY";
   }
 }
 
 void loop() {
-  pollSerialCommands();
-  lastMetrics = measurePower();
-  runAutoControl(lastMetrics);
-  if ((millis() - lastTelemetryMs) >= TELEMETRY_INTERVAL_MS) {
-    lastTelemetryMs = millis();
-    sendTelemetry(lastMetrics);
+  comandos();
+
+  static uint32_t tCiclo = 0;
+  uint16_t periodo = 1000 / lecturasPorSeg;
+  if (millis() - tCiclo < periodo) return;
+  tCiclo = millis();
+  numero++;
+
+  if (!adsAddr) iniciarADS();
+
+  uint16_t ventana = periodo - 15;
+
+  uint32_t nN = 0, sumN = 0, sqN = 0;
+  uint16_t minN = 1023, maxN = 0;
+  uint8_t cruces = 0;
+  uint32_t t1 = 0, t2 = 0;
+  bool arriba = (analogRead(ZMPT_PIN) > mCuentas);
+
+  uint16_t nA = 0;
+  double sumA = 0, sqA = 0;
+  double sumVsync = 0, sumVIsync = 0; // Para potencia activa P = cov(v, i) sin arreglos
+  float minA = 1e9, maxA = -1e9;
+  bool adsFalla = false, satA = false;
+  uint32_t tAds = micros();
+
+  uint32_t t0 = millis();
+  while (millis() - t0 < ventana) {
+    uint16_t v = analogRead(ZMPT_PIN);
+    nN++;
+    sumN += v;
+    sqN += (uint32_t)v * v;
+    if (v < minN) minN = v;
+    if (v > maxN) maxN = v;
+    bool a = arriba;
+    if (v > mCuentas + 3) a = true; else if (v < mCuentas - 3) a = false;
+    if (a && !arriba) {
+      uint32_t t = micros();
+      if (cruces == 0) t1 = t;
+      t2 = t;
+      if (cruces < 250) cruces++;
+    }
+    arriba = a;
+
+    if (adsAddr && !adsFalla && (uint32_t)(micros() - tAds) >= 1200) {
+      int16_t raw;
+      if (adsLeerContinuo(raw)) {
+        tAds = micros();
+        uint16_t vAfter = analogRead(ZMPT_PIN);
+        float vSync = 0.5f * ((float)v + (float)vAfter);
+
+        if (raw >= 32700 || raw <= -32700) satA = true;
+        float mv = raw * ADS_LSB_MV;
+        nA++;
+        sumA += mv;
+        sqA += (double)mv * mv;
+        sumVsync += vSync;
+        sumVIsync += (double)vSync * mv;
+        if (mv < minA) minA = mv;
+        if (mv > maxA) maxA = mv;
+      } else {
+        adsFalla = true;
+      }
+    }
+  }
+  if (adsFalla) adsAddr = 0;
+
+  // ---------- ZMPT: resultados ----------
+  float mN = (nN > 0) ? ((float)sumN / nN) : 512.0f;
+  float varN = (nN > 0) ? ((float)sqN / nN - mN * mN) : 0.0f;
+  mCuentas = mN;
+  float vMedia = mN * NANO_LSB_MV;
+  float vRmsMv = (varN > 0 ? sqrt(varN) : 0.0f) * NANO_LSB_MV;
+  float vMin   = minN * NANO_LSB_MV;
+  float vMax   = maxN * NANO_LSB_MV;
+  float ppV    = vMax - vMin;
+  float freq   = (cruces >= 3 && t2 > t1) ? (cruces - 1) * 1e6f / (float)(t2 - t1) : 0.0f;
+
+  bool senalFuerte = (ppV >= UMBRAL_AC_MV);
+  bool senalDebil  = (ppV >= UMBRAL_AC_DEBIL_MV && freq >= 50.0f && freq <= 70.0f);
+  bool hayV = (senalFuerte || senalDebil) && vMedia > 1500.0f && vMedia < 3500.0f;
+  float vrms = hayV ? vRmsMv * ZMPT_FACTOR : 0.0f;
+
+  // ---------- SCT: resultados ----------
+  bool adsOk = (nA >= 10);
+  float iMedia = 0.0f, iRmsMv = 0.0f, ppI = 0.0f;
+  if (adsOk) {
+    iMedia = (float)(sumA / nA);
+    double varA = sqA / nA - (double)iMedia * iMedia;
+    iRmsMv = (varA > 0) ? sqrt(varA) : 0.0f;
+    ppI = maxA - minA;
+  }
+  bool hayI = adsOk && ppI >= UMBRAL_SCT_MV;
+  float iScale = (1.0f / 1000.0f) / R_CARGA_OHM * RELACION_SCT * FACTOR_CORR_I;
+  float irms = hayI ? iRmsMv * iScale : 0.0f;
+
+  // ---------- Potencia Activa (P), Aparente (S), Reactiva (Q) y FP verdadero ----------
+  float p = 0.0f, s = vrms * irms, q = 0.0f, fp = 1.0f;
+  if (hayV && hayI && adsOk && s >= 1.0f) {
+    double meanVsync = sumVsync / nA;
+    double covVI = (sumVIsync / nA) - (meanVsync * (double)iMedia);
+    float vScale = NANO_LSB_MV * ZMPT_FACTOR;
+    float pCalc = fabs((float)(covVI * (double)vScale * (double)iScale));
+    if (pCalc > s) pCalc = s;
+    p = pCalc;
+    q = sqrt(max(0.0f, s * s - p * p));
+    fp = p / s;
+  }
+
+  runAutoControl(hayV, hayI, fp);
+
+  // ---------- Salida ----------
+  if (jsonMode) {
+    Serial.print(F("{\"t\":"));       Serial.print(millis());
+    Serial.print(F(",\"vrms\":"));   Serial.print(vrms, 2);
+    Serial.print(F(",\"irms\":"));   Serial.print(irms, 3);
+    Serial.print(F(",\"p\":"));      Serial.print(p, 1);
+    Serial.print(F(",\"q\":"));      Serial.print(q, 1);
+    Serial.print(F(",\"s\":"));      Serial.print(s, 1);
+    Serial.print(F(",\"fp\":"));     Serial.print(fp, 3);
+    Serial.print(F(",\"freq\":"));   Serial.print(freq, 1);
+    Serial.print(F(",\"steps\":["));
+    for (uint8_t i = 0; i < NUM_STEPS; i++) {
+      Serial.print(ledEstado[i] ? 1 : 0);
+      if (i < NUM_STEPS - 1) Serial.print(',');
+    }
+    Serial.print(F("],\"locked\":["));
+    for (uint8_t i = 0; i < NUM_STEPS; i++) {
+      Serial.print(getRemainingLockoutMs(i));
+      if (i < NUM_STEPS - 1) Serial.print(',');
+    }
+    Serial.print(F("],\"cap_uf\":")); Serial.print(getTotalConnectedCapacitanceUf(), 1);
+    Serial.print(F(",\"mode\":\""));  Serial.print(autoMode ? F("AUTO") : F("MANUAL"));
+    Serial.print(F("\",\"status\":\"")); Serial.print(systemStatus);
+    Serial.println(F("\"}"));
+  } else {
+    Serial.print('#'); pf((float)numero, 5, 0);
+    Serial.print(F(" | V ")); pf(vrms, 6, 1); Serial.print(F(" Vrms"));
+    Serial.print(F(" | I ")); pf(irms, 5, 2); Serial.print(F(" Arms"));
+    Serial.print(F(" | P ")); pf(p, 6, 1); Serial.print(F(" W"));
+    Serial.print(F(" | FP ")); pf(fp, 5, 3);
+    Serial.print(F(" | ")); Serial.println(systemStatus);
+    if (detalle) {
+      Serial.print(F("       ZMPT mV: media=")); Serial.print(vMedia, 0);
+      Serial.print(F(" pp=")); Serial.print(ppV, 0);
+      Serial.print(F(" | SCT dif mV: pp=")); Serial.print(ppI, 0);
+      Serial.print(F(" | muestras ZMPT=")); Serial.print(nN);
+      Serial.print(F(" SCT=")); Serial.println(nA);
+    }
   }
 }

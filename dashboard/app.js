@@ -1,7 +1,7 @@
 // POWERGuard - Lógica del Dashboard en Vivo (Web Serial API + Simulador)
 
-const STEP_CAPACITANCES = [22.0, 47.0, 69.0]; // uF por paso (D10, D11, D12)
-const STEP_PINS_LABEL = ["D10", "D11", "D12"];
+const STEP_CAPACITANCES = [22.0, 47.0, 69.0]; // uF por paso (D12, D11, D10)
+const STEP_PINS_LABEL = ["D12", "D11", "D10"];
 const MAX_HISTORY = 80;
 
 let serialPort = null;
