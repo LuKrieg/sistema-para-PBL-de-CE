@@ -85,11 +85,22 @@ body {
 .card-gauge { grid-column: span 5; display: flex; flex-direction: column; justify-content: space-between; }
 .card-kpis  { grid-column: span 7; }
 .card-bank  { grid-column: span 12; }
-.card-triangle { grid-column: span 5; }
-.card-chart { grid-column: span 7; }
+.charts-row {
+  grid-column: span 12;
+  display: grid;
+  grid-template-columns: 3fr 7fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+.card-triangle, .card-chart {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
 
 @media (max-width: 900px) {
-  .card-gauge, .card-kpis, .card-chart, .card-triangle { grid-column: span 12; }
+  .card-gauge, .card-kpis { grid-column: span 12; }
+  .charts-row { grid-template-columns: 1fr; }
 }
 
 .card-header {

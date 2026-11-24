@@ -176,9 +176,9 @@ function drawPowerTriangle(p, q, s, fp) {
   const phiDeg = Math.acos(Math.max(0, Math.min(1, fp))) * (180 / Math.PI);
   elTriangleAngle.textContent = `φ = ${phiDeg.toFixed(1)}°`;
 
-  const padL = 32, padR = 92, padT = 26, padB = 36;
-  const maxW = w - padL - padR;
-  const maxH = h - padT - padB;
+  const padL = 28, padR = 84, padT = 26, padB = 34;
+  const maxW = Math.max(40, w - padL - padR);
+  const maxH = Math.max(40, h - padT - padB);
 
   if (s < 1.0) {
     triCtx.fillStyle = "#9ca3af";

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>POWERGuard · Monitor en Vivo de Factor de Potencia</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=2" />
 </head>
 <body>
   <header class="topbar">
@@ -98,33 +98,36 @@
       </div>
     </section>
 
-    <!-- Triángulo de Potencias en Vivo (izquierda) -->
-    <section class="card card-triangle">
-      <div class="card-header">
-        <h2>Triángulo de Potencias</h2>
-        <span id="triangle-angle" class="muted">φ = 0.0°</span>
-      </div>
-      <div class="canvas-box">
-        <canvas id="triangle-chart"></canvas>
-      </div>
-    </section>
-
-    <!-- Gráfica en Tiempo Real (derecha) -->
-    <section class="card card-chart">
-      <div class="card-header">
-        <h2>Tendencia en Tiempo Real (FP y Corriente)</h2>
-        <div class="legend">
-          <span class="leg-fp">● FP</span>
-          <span class="leg-i">● Irms (A)</span>
-          <span class="leg-target">--- Meta 0.95–0.99</span>
+    <!-- Fila de Gráficas: 30% Triángulo (izq) / 70% Tendencia (der) -->
+    <div class="charts-row">
+      <!-- Triángulo de Potencias en Vivo (izquierda, 30%) -->
+      <section class="card card-triangle">
+        <div class="card-header">
+          <h2>Triángulo de Potencias</h2>
+          <span id="triangle-angle" class="muted">φ = 0.0°</span>
         </div>
-      </div>
-      <div class="canvas-box">
-        <canvas id="live-chart"></canvas>
-      </div>
-    </section>
+        <div class="canvas-box">
+          <canvas id="triangle-chart"></canvas>
+        </div>
+      </section>
+
+      <!-- Gráfica en Tiempo Real (derecha, 70%) -->
+      <section class="card card-chart">
+        <div class="card-header">
+          <h2>Tendencia en Tiempo Real (FP y Corriente)</h2>
+          <div class="legend">
+            <span class="leg-fp">● FP</span>
+            <span class="leg-i">● Irms (A)</span>
+            <span class="leg-target">--- Meta 0.95–0.99</span>
+          </div>
+        </div>
+        <div class="canvas-box">
+          <canvas id="live-chart"></canvas>
+        </div>
+      </section>
+    </div>
   </main>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>
