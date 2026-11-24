@@ -96,9 +96,23 @@ function updateGauge(fp) {
   elValFp.textContent = clamped.toFixed(3);
 }
 
+let lastTriangleData = { p: 0, q: 0, s: 0, fp: 1 };
+
+function syncCanvasSize(c, context) {
+  const rect = c.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const targetW = Math.max(100, Math.round(rect.width * dpr));
+  const targetH = Math.max(100, Math.round(rect.height * dpr));
+  if (c.width !== targetW || c.height !== targetH) {
+    c.width = targetW;
+    c.height = targetH;
+  }
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: rect.width, h: rect.height };
+}
+
 function drawChart() {
-  const w = canvas.width;
-  const h = canvas.height;
+  const { w, h } = syncCanvasSize(canvas, ctx);
   ctx.clearRect(0, 0, w, h);
 
   const padL = 42, padR = 42, padT = 18, padB = 24;
@@ -155,14 +169,14 @@ function drawChart() {
 }
 
 function drawPowerTriangle(p, q, s, fp) {
-  const w = triCanvas.width;
-  const h = triCanvas.height;
+  lastTriangleData = { p, q, s, fp };
+  const { w, h } = syncCanvasSize(triCanvas, triCtx);
   triCtx.clearRect(0, 0, w, h);
 
   const phiDeg = Math.acos(Math.max(0, Math.min(1, fp))) * (180 / Math.PI);
   elTriangleAngle.textContent = `φ = ${phiDeg.toFixed(1)}°`;
 
-  const padL = 36, padR = 64, padT = 28, padB = 38;
+  const padL = 32, padR = 92, padT = 26, padB = 36;
   const maxW = w - padL - padR;
   const maxH = h - padT - padB;
 
@@ -469,3 +483,8 @@ elBtnExport.addEventListener("click", () => {
 renderStepCards();
 drawChart();
 drawPowerTriangle(0, 0, 0, 1);
+
+window.addEventListener("resize", () => {
+  drawChart();
+  drawPowerTriangle(lastTriangleData.p, lastTriangleData.q, lastTriangleData.s, lastTriangleData.fp);
+});

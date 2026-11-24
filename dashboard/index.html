@@ -4,12 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>POWERGuard · Monitor en Vivo de Factor de Potencia</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="logo-dot"></div>
       <div>
         <h1>POWERGuard</h1>
         <p class="subtitle">Compensador Automático de Factor de Potencia · Equipo 12 (KEY Institute)</p>
@@ -98,7 +98,18 @@
       </div>
     </section>
 
-    <!-- Gráfica en Tiempo Real -->
+    <!-- Triángulo de Potencias en Vivo (izquierda) -->
+    <section class="card card-triangle">
+      <div class="card-header">
+        <h2>Triángulo de Potencias</h2>
+        <span id="triangle-angle" class="muted">φ = 0.0°</span>
+      </div>
+      <div class="canvas-box">
+        <canvas id="triangle-chart"></canvas>
+      </div>
+    </section>
+
+    <!-- Gráfica en Tiempo Real (derecha) -->
     <section class="card card-chart">
       <div class="card-header">
         <h2>Tendencia en Tiempo Real (FP y Corriente)</h2>
@@ -108,16 +119,9 @@
           <span class="leg-target">--- Meta 0.95–0.99</span>
         </div>
       </div>
-      <canvas id="live-chart" width="820" height="240"></canvas>
-    </section>
-
-    <!-- Triángulo de Potencias en Vivo -->
-    <section class="card card-triangle">
-      <div class="card-header">
-        <h2>Triángulo de Potencias</h2>
-        <span id="triangle-angle" class="muted">φ = 0.0°</span>
+      <div class="canvas-box">
+        <canvas id="live-chart"></canvas>
       </div>
-      <canvas id="triangle-chart" width="360" height="240"></canvas>
     </section>
   </main>
 
