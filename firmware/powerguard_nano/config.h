@@ -38,6 +38,11 @@ const float RELACION_SCT  = 2000.0f; // SCT-013-000: 100 A : 50 mA
 const float R_CARGA_OHM   = 35.5f;   // Resistencia R4 medida
 const float FACTOR_CORR_I = 2.0f;    // Factor empírico vs pinza amperimétrica
 
+// Compensación de fase en microsegundos (v(t - phaseDelayUs) vs i(t))
+// ~580 us compensa la mitad del periodo de conversión del ADS1115 (860 SPS = 1163 us).
+// Ajustable en vivo por Serial con '+' y '-' (pasos de 50 us).
+const int16_t DEFAULT_PHASE_DELAY_US = 580;
+
 // Control del Factor de Potencia
 const float FP_TARGET_MIN = 0.95f;
 const float FP_TARGET_MAX = 0.99f;

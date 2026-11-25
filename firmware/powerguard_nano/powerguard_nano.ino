@@ -5,7 +5,8 @@
  * - I2C por software en A1 (SDA) y A2 (SCL), sin librerías externas.
  * - ZMPT101B en A0 del Nano, SCT-013-000 en ADS1115 (A0-A1 diferencial continuo).
  * - 3 pasos / LEDs en D12 (D1), D11 (D2), D10 (D3).
- * - Calcula Vrms, Irms, P, Q, S, FP verdadero y frecuencia en tiempo real.
+ * - Compensación de fase por buffer circular (DEFAULT_PHASE_DELAY_US = 580 us)
+ *   y ventana de muestreo múltiplo exacto de 60 Hz (167 ms = 10 ciclos).
  *
  * Comandos Serial (115200 baud):
  *   1 / 2 / 3   -> alternar paso/LED D1/D2/D3 (modo MANUAL)
@@ -14,6 +15,7 @@
  *   r           -> cambiar entre 5 y 10 lecturas por segundo
  *   t           -> alternar salida JSON (Dashboard) / Tabla texto (Monitor Serie)
  *   d           -> mostrar / ocultar detalle en mV (en modo tabla texto)
+ *   + / -       -> subir / bajar compensación de fase en 50 us
  *   MODE:AUTO   -> control automático (FP entre 0.95 y 0.99)
  *   MODE:MANUAL -> control manual
  *   STEP:i:v    -> activar (v=1) o desactivar (v=0) paso i (0..2)
@@ -37,10 +39,52 @@ const char* systemStatus = "INIT";
 bool jsonMode = true;         // true = JSON para Dashboard, false = tabla v4.1
 bool detalle = false;         // comando 'd'
 float mCuentas = 512.0f;      // media del ZMPT (en cuentas) de la ventana anterior
+int16_t phaseDelayUs = DEFAULT_PHASE_DELAY_US;
 uint32_t numero = 0;
 
 char serialCmdBuf[32];
 uint8_t serialCmdLen = 0;
+
+// Buffer circular de últimas lecturas de ZMPT para alinear fase con ADS1115
+const uint8_t V_RING_SIZE = 16;
+uint16_t vRingVal[V_RING_SIZE];
+uint32_t vRingTime[V_RING_SIZE];
+uint8_t vRingHead = 0;
+uint8_t vRingCount = 0;
+
+inline void pushVoltageSample(uint16_t val, uint32_t tUs) {
+  vRingVal[vRingHead] = val;
+  vRingTime[vRingHead] = tUs;
+  vRingHead = (vRingHead + 1) % V_RING_SIZE;
+  if (vRingCount < V_RING_SIZE) vRingCount++;
+}
+
+// Interpola v(tTarget) dentro del buffer circular
+float lookupVoltageAt(uint32_t tTargetUs, uint16_t fallbackVal) {
+  if (vRingCount == 0) return (float)fallbackVal;
+  if (vRingCount == 1) return (float)vRingVal[(vRingHead + V_RING_SIZE - 1) % V_RING_SIZE];
+
+  uint8_t newestIdx = (vRingHead + V_RING_SIZE - 1) % V_RING_SIZE;
+  if ((int32_t)(tTargetUs - vRingTime[newestIdx]) >= 0) {
+    return (float)vRingVal[newestIdx];
+  }
+
+  for (uint8_t step = 0; step < vRingCount - 1; step++) {
+    uint8_t idxB = (vRingHead + V_RING_SIZE - 1 - step) % V_RING_SIZE;
+    uint8_t idxA = (vRingHead + V_RING_SIZE - 2 - step) % V_RING_SIZE;
+    uint32_t tA = vRingTime[idxA];
+    uint32_t tB = vRingTime[idxB];
+    if ((int32_t)(tTargetUs - tA) >= 0 && (int32_t)(tB - tTargetUs) >= 0) {
+      uint32_t span = tB - tA;
+      if (span == 0) return (float)vRingVal[idxB];
+      float alpha = (float)(tTargetUs - tA) / (float)span;
+      return (float)vRingVal[idxA] + alpha * ((float)vRingVal[idxB] - (float)vRingVal[idxA]);
+    }
+  }
+
+  uint8_t oldestIdx = (vRingHead + V_RING_SIZE - vRingCount) % V_RING_SIZE;
+  return (float)vRingVal[oldestIdx];
+}
 
 // ---------- I2C por software (solo bajar o soltar la línea) ----------
 inline void i2cDelay() { delayMicroseconds(5); }
@@ -280,6 +324,10 @@ void processCommand(const char* cmd) {
     detalle = !detalle;
   } else if (strcmp(cmd, "t") == 0 || strcmp(cmd, "T") == 0) {
     jsonMode = !jsonMode;
+  } else if (strcmp(cmd, "+") == 0) {
+    if (phaseDelayUs <= 1950) phaseDelayUs += 50;
+  } else if (strcmp(cmd, "-") == 0) {
+    if (phaseDelayUs >= -1950) phaseDelayUs -= 50;
   } else if (strncmp(cmd, "STEP:", 5) == 0) {
     int idx = -1, val = 0;
     if (sscanf(cmd, "STEP:%d:%d", &idx, &val) == 2 && idx >= 0 && idx < NUM_STEPS) {
@@ -292,10 +340,9 @@ void processCommand(const char* cmd) {
 void comandos() {
   while (Serial.available()) {
     char c = (char)Serial.read();
-    // Soporte inmediato de comandos de 1 carácter cuando llegan sueltos desde Monitor Serie
     if (serialCmdLen == 0 && (c == '0' || c == '1' || c == '2' || c == '3' ||
         c == 'l' || c == 'L' || c == 'r' || c == 'R' || c == 'd' || c == 'D' ||
-        c == 't' || c == 'T')) {
+        c == 't' || c == 'T' || c == '+' || c == '-')) {
       char single[2] = {c, '\0'};
       processCommand(single);
       continue;
@@ -352,7 +399,11 @@ void loop() {
 
   if (!adsAddr) iniciarADS();
 
-  uint16_t ventana = periodo - 15;
+  // Ventana múltiplo exacto de 60 Hz (167 ms = 10 ciclos, 83 ms = 5 ciclos)
+  uint16_t ventana = (lecturasPorSeg == 5) ? 167 : 83;
+
+  vRingHead = 0;
+  vRingCount = 0;
 
   uint32_t nN = 0, sumN = 0, sqN = 0;
   uint16_t minN = 1023, maxN = 0;
@@ -362,14 +413,22 @@ void loop() {
 
   uint16_t nA = 0;
   double sumA = 0, sqA = 0;
-  double sumVsync = 0, sumVIsync = 0; // Para potencia activa P = cov(v, i) sin arreglos
+  double sumVsync = 0, sumVIsync = 0;
   float minA = 1e9, maxA = -1e9;
-  bool adsFalla = false, satA = false;
+  bool adsFalla = false;
   uint32_t tAds = micros();
+
+  // Soporte para phaseDelayUs negativo (esperar v(t + |delay|))
+  bool pendingAds = false;
+  float pendingMv = 0.0f;
+  uint32_t pendingTargetUs = 0;
 
   uint32_t t0 = millis();
   while (millis() - t0 < ventana) {
+    uint32_t tv = micros();
     uint16_t v = analogRead(ZMPT_PIN);
+    pushVoltageSample(v, tv);
+
     nN++;
     sumN += v;
     sqN += (uint32_t)v * v;
@@ -385,22 +444,41 @@ void loop() {
     }
     arriba = a;
 
+    // Resolver muestra pendiente si phaseDelayUs < 0
+    if (pendingAds && (int32_t)(tv - pendingTargetUs) >= 0) {
+      float vSync = lookupVoltageAt(pendingTargetUs, v);
+      nA++;
+      sumA += pendingMv;
+      sqA += (double)pendingMv * pendingMv;
+      sumVsync += vSync;
+      sumVIsync += (double)vSync * pendingMv;
+      if (pendingMv < minA) minA = pendingMv;
+      if (pendingMv > maxA) maxA = pendingMv;
+      pendingAds = false;
+    }
+
     if (adsAddr && !adsFalla && (uint32_t)(micros() - tAds) >= 1200) {
       int16_t raw;
       if (adsLeerContinuo(raw)) {
-        tAds = micros();
-        uint16_t vAfter = analogRead(ZMPT_PIN);
-        float vSync = 0.5f * ((float)v + (float)vAfter);
-
-        if (raw >= 32700 || raw <= -32700) satA = true;
+        uint32_t tRead = micros();
+        tAds = tRead;
         float mv = raw * ADS_LSB_MV;
-        nA++;
-        sumA += mv;
-        sqA += (double)mv * mv;
-        sumVsync += vSync;
-        sumVIsync += (double)vSync * mv;
-        if (mv < minA) minA = mv;
-        if (mv > maxA) maxA = mv;
+
+        if (phaseDelayUs >= 0) {
+          uint32_t tTarget = tRead - (uint32_t)phaseDelayUs;
+          float vSync = lookupVoltageAt(tTarget, v);
+          nA++;
+          sumA += mv;
+          sqA += (double)mv * mv;
+          sumVsync += vSync;
+          sumVIsync += (double)vSync * mv;
+          if (mv < minA) minA = mv;
+          if (mv > maxA) maxA = mv;
+        } else {
+          pendingMv = mv;
+          pendingTargetUs = tRead + (uint32_t)(-phaseDelayUs);
+          pendingAds = true;
+        }
       } else {
         adsFalla = true;
       }
@@ -462,6 +540,7 @@ void loop() {
     Serial.print(F(",\"s\":"));      Serial.print(s, 1);
     Serial.print(F(",\"fp\":"));     Serial.print(fp, 3);
     Serial.print(F(",\"freq\":"));   Serial.print(freq, 1);
+    Serial.print(F(",\"phase_us\":")); Serial.print(phaseDelayUs);
     Serial.print(F(",\"steps\":["));
     for (uint8_t i = 0; i < NUM_STEPS; i++) {
       Serial.print(ledEstado[i] ? 1 : 0);
@@ -482,6 +561,7 @@ void loop() {
     Serial.print(F(" | I ")); pf(irms, 5, 2); Serial.print(F(" Arms"));
     Serial.print(F(" | P ")); pf(p, 6, 1); Serial.print(F(" W"));
     Serial.print(F(" | FP ")); pf(fp, 5, 3);
+    Serial.print(F(" | ph=")); Serial.print(phaseDelayUs); Serial.print(F("us"));
     Serial.print(F(" | ")); Serial.println(systemStatus);
     if (detalle) {
       Serial.print(F("       ZMPT mV: media=")); Serial.print(vMedia, 0);
