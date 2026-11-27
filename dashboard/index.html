@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>POWERGuard · Monitor en Vivo de Factor de Potencia</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
-  <link rel="stylesheet" href="styles.css?v=2" />
+  <link rel="stylesheet" href="styles.css?v=5" />
 </head>
 <body>
   <header class="topbar">
@@ -47,8 +47,18 @@
       <div class="mode-bar">
         <span>Modo de control:</span>
         <div class="btn-group">
-          <button id="btn-auto" class="btn-mode active">AUTO</button>
-          <button id="btn-manual" class="btn-mode">MANUAL</button>
+          <button id="btn-auto" class="btn-mode">AUTO</button>
+          <button id="btn-manual" class="btn-mode active">MANUAL</button>
+        </div>
+      </div>
+      <div class="mode-bar cal-bar">
+        <span>Fase: <strong id="val-phase">—</strong> · Carga: <strong id="val-carga">—</strong></span>
+        <div class="btn-group">
+          <button id="btn-ph-minus" class="btn-mode" title="Retardo de fase −50 µs">−</button>
+          <button id="btn-ph-plus" class="btn-mode" title="Retardo de fase +50 µs">+</button>
+          <input id="cal-fp" class="cal-input" type="number" step="0.01" min="0.05" max="1" value="0.20"
+                 title="FP real conocido de la carga conectada (0.20 motor en vacío sin capacitores, 1.00 foco/plancha)" />
+          <button id="btn-cal" class="btn-mode" title="Ajusta la fase para que el FP medido sea el valor indicado">Calibrar</button>
         </div>
       </div>
     </section>
@@ -85,17 +95,36 @@
           <strong id="val-cap" class="kpi-val">0.0 µF</strong>
         </div>
       </div>
+
+      <div class="assist">
+        <div class="assist-head">
+          <h3>Asistente de compensación</h3>
+          <span id="assist-load" class="muted">Esperando carga…</span>
+        </div>
+        <div id="assist-rows"></div>
+        <p id="assist-note" class="muted"></p>
+        <button type="button" id="btn-all-off" class="btn-mode">Apagar todos los capacitores</button>
+      </div>
     </section>
 
     <!-- Banco de Capacitores (3 Pasos) -->
     <section class="card card-bank">
       <div class="card-header">
         <h2>Banco de Capacitores (3 Pasos · D12, D11, D10)</h2>
-        <span class="muted">Bloqueo RC: 100 kΩ</span>
+        <span class="muted">Descarga a 50 V (100 kΩ): 2.4 s · 3.7 s · 9.8 s</span>
       </div>
       <div class="steps-grid" id="steps-container">
         <!-- Generado dinámicamente por app.js -->
       </div>
+    </section>
+
+    <!-- Memoria de cálculo: fórmulas de clase con los números en vivo -->
+    <section class="card card-memoria">
+      <div class="card-header">
+        <h2>Memoria de cálculo (fórmulas de clase)</h2>
+        <span class="muted">Valores calculados por el Arduino · se exportan en el CSV</span>
+      </div>
+      <div id="memoria"><p class="muted">Esperando carga…</p></div>
     </section>
 
     <!-- Fila de Gráficas: 30% Triángulo (izq) / 70% Tendencia (der) -->
@@ -128,6 +157,6 @@
     </div>
   </main>
 
-  <script src="app.js?v=2"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>

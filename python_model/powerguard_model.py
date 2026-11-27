@@ -23,8 +23,8 @@ DEFAULT_FP_TARGET = 0.95
 DEFAULT_FP_MAX = 0.99
 DEFAULT_DISCHARGE_R_OHMS = 100_000.0  # R9-R12 = 100 kOhm
 
-# Pasos del banco físico validado (3 pasos: 22 uF, 47 uF, 69 uF -> total 138 uF)
-DEFAULT_BANK_STEPS_UF: Tuple[float, float, float] = (22.0, 47.0, 69.0)
+# Pasos del banco físico validado (3 pasos: 20 uF, 30 uF, 80 uF -> total 130 uF)
+DEFAULT_BANK_STEPS_UF: Tuple[float, float, float] = (20.0, 30.0, 80.0)
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ class MotorOperatingPoint:
 
 # Datos de placa (WEG 0.5 HP, 4 polos, 60 Hz, 110/220 V) y Tabla 6 de la propuesta
 WEG_MOTOR_POINTS: List[MotorOperatingPoint] = [
-    MotorOperatingPoint(load_pct=0,   p_out_w=60.00,  efficiency_pct=0.0,  fp_base=0.27, p_in_w=60.0),
+    MotorOperatingPoint(load_pct=0,   p_out_w=60.00,  efficiency_pct=0.0,  fp_base=0.20, p_in_w=60.0),  # en vacío: FP medido 0.20
     MotorOperatingPoint(load_pct=25,  p_out_w=93.25,  efficiency_pct=38.0, fp_base=0.35, p_in_w=245.4),
     MotorOperatingPoint(load_pct=50,  p_out_w=186.50, efficiency_pct=47.2, fp_base=0.43, p_in_w=395.1),
     MotorOperatingPoint(load_pct=75,  p_out_w=279.75, efficiency_pct=55.3, fp_base=0.51, p_in_w=505.9),
@@ -128,6 +128,81 @@ def predict_compensated_state(
     }
 
 
+def memoria_de_calculo(
+    v_rms: float,
+    i_rms: float,
+    p_w: float,
+    inductiva: bool = True,
+    c_uf: float = 0.0,
+    fp_target: float = DEFAULT_FP_TARGET,
+    freq_hz: float = DEFAULT_FREQ_HZ,
+) -> Dict[str, float]:
+    """
+    Misma secuencia de fórmulas que calcularTriangulos() del firmware (powerguard_v7.ino),
+    para verificar a mano o en Python los valores que reporta el Arduino.
+
+      1) S = Vrms·Irms,  FP = P/S,  θ = ±arccos(FP),  Q = S·sen θ
+      3) |Z| = V/I,  R = |Z|cos θ,  X = |Z|sen θ,  FP = R/|Z|
+      4) Y = 1/Z = G − jB,  G = R/|Z|²,  B = X/|Z|²
+      5) Capacitor en paralelo:  Bc = ωC,  Qc = ωCV²
+      6) Y' = G − j(B − ωC),  FP' = G/|Y'|,  I' = V|Y'|,  Q' = V²(B − ωC)
+      7) Qc = P(tan θ1 − tan θ2),  C = Qc/(ωV²);  C ideal (FP = 1) = B/ω
+    Supone banco SIMULADO (la medición es la de la carga sola).
+    """
+    omega = 2.0 * math.pi * freq_hz
+    s = v_rms * i_rms
+    fp = min(1.0, p_w / s)
+    theta = math.acos(fp) * (1.0 if inductiva else -1.0)
+    q = s * math.sin(theta)
+
+    z = v_rms / i_rms
+    r = z * math.cos(theta)
+    x = z * math.sin(theta)
+
+    g = r / z ** 2
+    b = x / z ** 2
+
+    bc = omega * c_uf * 1e-6
+    qc = bc * v_rms ** 2
+
+    bn = b - bc
+    yn = math.hypot(g, bn)
+    fp_new = g / yn
+    i_new = v_rms * yn
+
+    tan1 = q / p_w
+    tan2 = math.tan(math.acos(fp_target))
+    q_req = p_w * (tan1 - tan2)
+    c_req_uf = q_req / (omega * v_rms ** 2) * 1e6
+    c_ideal_uf = b / omega * 1e6
+
+    return {
+        "S_va": s, "FP": fp, "theta_deg": math.degrees(theta), "Q_var": q,
+        "Z_ohm": z, "R_ohm": r, "X_ohm": x, "FP_R_sobre_Z": r / z,
+        "G_S": g, "B_S": b,
+        "Bc_S": bc, "Qc_var": qc,
+        "Bn_S": bn, "FP_compensado": fp_new, "theta_compensado_deg": math.degrees(math.atan2(bn, g)),
+        "I_compensada_a": i_new, "S_compensada_va": v_rms * i_new, "Q_compensada_var": v_rms ** 2 * bn,
+        "P_desde_G_w": v_rms ** 2 * g,
+        "tan1": tan1, "tan2": tan2, "Qc_requerida_var": q_req,
+        "C_requerida_uf": c_req_uf, "C_ideal_fp1_uf": c_ideal_uf,
+    }
+
+
+def correccion_por_admitancia(g_s: float, b_s: float, v_rms: float, freq_hz: float = DEFAULT_FREQ_HZ) -> Dict[str, float]:
+    """
+    Corrección con un capacitor (método de admitancia, caso 'La celda que se calienta'):
+    Y = G − jB; el capacitor suma +jωC, así que para cancelar la parte imaginaria ωC = B.
+    """
+    omega = 2.0 * math.pi * freq_hz
+    c = b_s / omega
+    return {
+        "FP_antes": g_s / math.hypot(g_s, b_s),   # FP = G/|Y| = cos θ
+        "C_uf": c * 1e6,
+        "Qc_var": omega * c * v_rms ** 2,
+    }
+
+
 def measurement_error_pct(fp_measured: float, fp_calculated: float) -> float:
     """Calcula el error porcentual según la ecuación (2) de la propuesta."""
     if fp_calculated == 0:
@@ -212,7 +287,7 @@ def print_report() -> None:
         tau = DEFAULT_DISCHARGE_R_OHMS * c_uf * 1e-6
         print(f"  Paso J{idx} ({c_uf:>4.1f} uF): tau = {tau:.2f} s, t(<50V) = {t_safe:.2f} s")
 
-    print("\nCombinaciones válidas en rango [0.95, 0.99] (banco 22 / 47 / 69 uF):")
+    print("\nCombinaciones válidas en rango [0.95, 0.99] (banco 20 / 30 / 80 uF):")
     for pt in WEG_MOTOR_POINTS:
         combos = simulate_all_bank_combinations(pt)
         valid = [c for c in combos if c["en_rango_095_099"]]

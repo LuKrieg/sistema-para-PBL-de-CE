@@ -20,9 +20,8 @@ sistema para PBL de CE/
 ├── docs/
 │   └── arquitectura_y_cambios.md      # Detalle técnico de medición, ADS1115 y conmutación sin MOC/Triac
 ├── firmware/
-│   └── powerguard_nano/
-│       ├── config.h                   # Pines, calibración, capacitancias y tiempos de seguridad
-│       └── powerguard_nano.ino        # Firmware Arduino Nano (muestreo True-RMS/FP + control + JSON Serial)
+│   └── powerguard_v8/
+│       └── powerguard_v8.ino          # Firmware Arduino Nano (todo en un archivo; configuración al inicio)
 ├── python_model/
 │   ├── requirements.txt               # Dependencias de Python
 │   ├── powerguard_model.py            # Modelo teórico del motor WEG 0.5 HP y 16 combinaciones del banco
@@ -43,8 +42,8 @@ sistema para PBL de CE/
 | Requisito del docente | Implementación en este repositorio |
 | :--- | :--- |
 | **Sistema monofásico 120 V, 60 Hz (motor WEG 0.5 HP)** | Parámetros de placa (0.37 kW, 9.58 A @ 110 V, FP 0.43–0.59) cargados en `powerguard_model.py`. |
-| **Medición en vivo (Método 3: muestreo de $v(t)$ e $i(t)$)** | `powerguard_nano.ino` muestrea `ZMPT101B` y `SCT-013` vía `ADS1115` (I2C) y calcula $V_{rms}, I_{rms}, P, Q, S, FP$ verdadero. |
-| **Corrección de retraso del ADS1115** | Interpolación lineal temporal entre muestras consecutivas de tensión/corriente + ajuste fino de fase por software (`config.h`). |
+| **Medición en vivo (Método 3: muestreo de $v(t)$ e $i(t)$)** | `powerguard_v8.ino` muestrea `ZMPT101B` y `SCT-013` vía `ADS1115` (I2C) y calcula $V_{rms}, I_{rms}, P, Q, S, FP$ verdadero. |
+| **Corrección de retraso del ADS1115** | Interpolación lineal temporal entre muestras consecutivas de tensión/corriente + calibración de fase por software (comando `CAL`, guardada en EEPROM). |
 | **Modelo en Python con fórmulas de clase** | `powerguard_model.py` calcula $S, P, Q, FP, Q_C, C$, descarga $V(t)=V_0 e^{-t/RC}$, error % y predice las 16 combinaciones del banco. |
 | **Comparación modelo vs mediciones (< 4% error)** | `validate_measurements.py` evalúa lecturas CSV contra el modelo teórico y reporta el cumplimiento de la meta `< 4%`. |
 | **Control del banco (0.95–0.99) y seguridad** | Histéresis 0.95–0.99, detección de sobrecompensación, tiempo entre maniobras y bloqueo por descarga RC. |
@@ -73,10 +72,10 @@ python validate_measurements.py --input pruebas_simuladas.csv
 ```
 
 ### C. Firmware en Arduino Nano
-1. Abrir `firmware/powerguard_nano/powerguard_nano.ino` en **Arduino IDE**.
-2. Instalar la librería **Adafruit ADS1X15** (o compatible con ADS1115 vía Library Manager).
-3. Revisar `config.h` (pines de los 4 relés `D4..D7`, lógica `RELAY_ACTIVE_LOW`, constantes de calibración de `ZMPT101B` y `SCT-013-030`).
-4. Subir al **Arduino Nano** (ATmega328P, 115200 baud).
+1. Abrir `firmware/powerguard_v8/powerguard_v8.ino` en **Arduino IDE**.
+2. No necesita librerías externas (el ADS1115 se lee por I2C por software).
+3. Revisar la sección CONFIGURACIÓN al inicio del `.ino` (pines, capacitancias 20/30/80 µF, calibración de `ZMPT101B` y `SCT-013`).
+4. Subir al **Arduino Nano** (ATmega328P, 115200 baud). Ver el [manual de uso](docs/MANUAL_DE_USO.md).
 
 ### D. Dashboard HTML en vivo
 1. Abrir `dashboard/index.html` en **Google Chrome** o **Microsoft Edge**.

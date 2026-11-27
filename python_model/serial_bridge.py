@@ -75,7 +75,7 @@ class PowerGuardSimulator:
         p_meas = s_meas * fp_meas
         q_meas = (max(0.0, s_meas ** 2 - p_meas ** 2)) ** 0.5
 
-        # Lógica de control idéntica a powerguard_nano.ino
+        # Lógica de control idéntica a powerguard_v8.ino
         if (t_sec - self.last_switch_t) >= 3.0:
             if self.awaiting_check and self.last_added_step >= 0:
                 self.awaiting_check = False
