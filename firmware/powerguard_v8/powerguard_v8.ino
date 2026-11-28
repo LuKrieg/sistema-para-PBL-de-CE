@@ -5,9 +5,9 @@
  * - I2C por software en A1 (SDA) y A2 (SCL), sin librerías externas.
  * - ZMPT101B en A0 del Nano, SCT-013-000 en ADS1115 (A0-A1 diferencial continuo).
  * - 3 pasos / LEDs en D12 (D1), D11 (D2), D10 (D3).
- * - Compensación de fase por buffer circular (phaseDelayUs, calibrable con CAL:x y
+ * - Compensación de fase por buffer circular (phaseDelayUs, calibrable con CAL:1.00 y
  *   guardada en EEPROM) y ventana de muestreo múltiplo exacto de 60 Hz (167 ms = 10 ciclos).
- * - Q con signo (+ inductiva / - capacitiva) usando v retrasado T/4.
+ * - Q estimada por cuadratura (+ inductiva / - capacitiva) con tensión casi sinusoidal.
  * - Arranca en MANUAL con todos los pasos apagados (START_IN_AUTO en la sección CONFIGURACIÓN).
  *
  * Comandos Serial (115200 baud):
@@ -20,9 +20,8 @@
  *   + / -       -> subir / bajar compensación de fase en 50 us
  *   PH:x        -> fijar compensación de fase en us (ej. PH:1700)
  *   m           -> imprimir la MEMORIA DE CÁLCULO completa (fórmulas con números) por Serial
- *   CAL:x       -> calibrar fase con una carga de FP real conocido x
- *                  (CAL:1.00 con foco/plancha, CAL:0.20 con el motor en vacío sin capacitores)
- *   MODE:AUTO   -> control automático (FP entre 0.95 y 0.99)
+ *   CAL:1.00    -> calibrar fase en manual con carga resistiva y pasos apagados
+ *   MODE:AUTO   -> control automático (FP entre 0.95 y 1.00)
  *   MODE:MANUAL -> control manual
  *   STEP:i:v    -> activar (v=1) o desactivar (v=0) paso i (0..2)
  */
@@ -48,7 +47,7 @@ const uint8_t LED_PIN[NUM_STEPS] = {12, 11, 10}; // D1=D12, D2=D11, D3=D10
 const bool RELAY_ACTIVE_LOW = false;              // false: activos en HIGH
 
 // Capacitancias equivalentes de cada paso (uF)
-const float STEP_CAPACITANCE_UF[NUM_STEPS] = {20.0f, 30.0f, 80.0f};
+const float STEP_CAPACITANCE_UF[NUM_STEPS] = {60.0f, 60.0f, 60.0f};
 const float DISCHARGE_RESISTOR_OHMS = 100000.0f;  // 100 kOhm
 
 // Conversión ADC
@@ -73,20 +72,16 @@ const float FACTOR_CORR_I = 2.0f;    // Factor empírico vs pinza amperimétrica
 // Estimado: 0.58 ms (centro de la conversión) + 0.58 ms (retardo medio hasta la lectura)
 //           + ~0.55 ms (I2C)  ->  ~1700 us  (~37 grados a 60 Hz si NO se compensa).
 // Se calibra en vivo y se guarda en EEPROM (no se pierde al reiniciar):
-//   CAL:1.00  -> con carga resistiva pura (foco incandescente, plancha): FP real = 1
-//   CAL:0.20  -> con el motor en vacío SIN capacitores, si su FP real es 0.20
+//   CAL:1.00  -> con carga resistiva pura en manual, con los pasos apagados
 //   PH:1700   -> fija el retardo a mano (us);  '+' / '-' -> +/- 50 us (1.08 grados)
 const int16_t DEFAULT_PHASE_DELAY_US = 1700;
 const int16_t PHASE_DELAY_MIN_US     = -1950;
 const int16_t PHASE_DELAY_MAX_US     = 4000;
 const uint16_t QUARTER_PERIOD_US     = 4167;   // T/4 a 60 Hz (v retrasado 90 grados -> signo de Q)
-// Las lecturas no están sincronizadas con las conversiones: el retardo varía 0-1.16 ms
-// y eso atenúa P en sin(x)/x = 0.992. Se compensa con esta ganancia.
-const float PHASE_JITTER_GAIN        = 1.008f;
 
 // Control del Factor de Potencia
 const float FP_TARGET_MIN = 0.95f;
-const float FP_TARGET_MAX = 0.99f;
+const float FP_MIN_IMPROVEMENT = 0.005f;
 const unsigned long MIN_SWITCH_INTERVAL_MS   = 3000UL;
 const bool START_IN_AUTO = false;   // false: arranca en MANUAL con todos los pasos apagados
 
@@ -98,7 +93,7 @@ const bool SIMULATED_BANK = true;
 
 // Bloqueo de reconexión por descarga RC: se espera solo hasta que el capacitor
 // baje de LINE_PEAK_V a DISCHARGE_SAFE_V:  t = R*C*ln(Vpico / Vseguro)
-// Con 100 kOhm: 20 uF -> 2.4 s, 30 uF -> 3.7 s, 80 uF -> 9.8 s (antes 5*tau: 10 / 15 / 40 s)
+// Con 100 kOhm y 60 uF: aproximadamente 7.33 s por paso.
 const float LINE_PEAK_V      = 169.7f;  // 120 V * raiz(2)
 const float DISCHARGE_SAFE_V = 50.0f;   // voltaje seguro residual
 const unsigned long MIN_DISCHARGE_LOCKOUT_MS = 2000UL;
@@ -115,9 +110,6 @@ unsigned long dischargeLockoutMs[NUM_STEPS] = {0, 0, 0};
 unsigned long lastSwitchMs = 0;
 
 bool autoMode = START_IN_AUTO;
-bool awaitingStepCheck = false;
-int8_t lastAddedStep = -1;
-float fpBeforeStep = 0.0f;
 const char* systemStatus = "INIT";
 
 bool jsonMode = true;         // true = JSON para Dashboard, false = tabla v4.1
@@ -156,6 +148,7 @@ void fijarFase(long us) {
   if (us < PHASE_DELAY_MIN_US) us = PHASE_DELAY_MIN_US;
   if (us > PHASE_DELAY_MAX_US) us = PHASE_DELAY_MAX_US;
   phaseDelayUs = (int16_t)us;
+  lastThetaValid = false;
   EEPROM.put(EE_ADDR_MAGIC, EE_MAGIC);
   EEPROM.put(EE_ADDR_PHASE, phaseDelayUs);
   EEPROM.put(EE_ADDR_POL, polaridadI);
@@ -213,31 +206,15 @@ float lookupVoltageAt(uint32_t tTargetUs, uint16_t fallbackVal) {
 // =====================================================================================
 //  MEMORIA DE CÁLCULO  (fórmulas de clase: Lecture 16 · Modelos de circuitos AC)
 // =====================================================================================
-//  Convención: θ = θv − θi.  θ > 0 -> corriente atrasada (carga INDUCTIVA),
-//                            θ < 0 -> corriente adelantada (carga CAPACITIVA).
-//
-//  1) Medición          P = (1/N)·Σ v(t)·i(t)              (potencia promedio)
-//                       S = Vrms · Irms
-//  2) Triángulo de      FP = P / S = cos θ
-//     potencias         θ  = ± arccos(FP)                    (signo por el desfase medido)
-//                       Q  = S · sen θ
-//  3) Triángulo de      |Z| = Vrms / Irms
-//     impedancia        R = |Z| · cos θ ,  X = |Z| · sen θ  ,  FP = R / |Z|
-//  4) Admitancia        Y = 1/Z = G − jB ,  G = R/|Z|² ,  B = X/|Z|²
-//  5) Capacitor en      Zc = −j/(ωC)  ->  suma +jωC a la admitancia
-//     paralelo          Bc = ωC ,  Qc = ωC·V²
-//  6) Compensado        Y' = G − j(B − ωC) ;  FP' = G/|Y'| = cos θ'
-//                       I' = V·|Y'| ,  S' = V·I' ,  Q' = V²·(B − ωC) = Q − Qc ,  P = V²·G
-//  7) Corrección        Qc = P·(tan θ1 − tan θ2) ,  C = Qc / (ωV²)
-//     requerida         C ideal (FP = 1): ωC = B  ->  C = B/ω
-//  8) Verificación      FP = cos(θv − θi) con el ángulo medido directamente entre v(t) e i(t)
+//  FP verdadero = P / (Vrms * Irms). Q se estima por cuadratura.
+//  El banco cambia Q, y el modelo conserva el residuo sqrt(S^2 - P^2 - Q^2).
 // =====================================================================================
 const float OMEGA = 2.0f * PI * 60.0f;   // ω = 2πf = 377 rad/s
 
 struct Calculo {
   bool valido;
   // 1) medición
-  float V, Imed, P, Smed, FPmed, thMed;
+  float V, Imed, P, Smed, FPmed, Qmed, residual, measuredResidual;
   // 2) carga sola (motor, sin capacitores)
   float S0, FP0, th0, Q0, I0;
   // 3) impedancia de la carga
@@ -247,9 +224,10 @@ struct Calculo {
   // 5) banco de capacitores conectado
   float C, Bc, Qc;
   // 6) sistema compensado
-  float Bn, Yn, FP, th, In, Sn, Qn;
+  float Bn, FP, th, In, Sn, Qn;
   // 7) corrección requerida
-  float tan1, tan2, Qreq, Creq, C1;
+  float tan2, Qreq, Creq, C1;
+  bool correctionReachable;
   // 8) verificación por ángulo medido
   float thVI, FPvi;
 };
@@ -257,8 +235,12 @@ Calculo calc;
 
 inline float aGrados(float rad) { return rad * 180.0f / PI; }
 
-// V, I, P medidos; inductiva = signo del desfase; cUf = capacitancia conectada
-void calcularTriangulos(float V, float I, float P, bool inductiva, float cUf) {
+float apparentPower(float p, float q, float residual) {
+  return sqrt(p * p + q * q + residual * residual);
+}
+
+// Banco en paralelo con tensión casi sinusoidal. El residuo no activo se conserva.
+void calcularTriangulos(float V, float I, float P, float qEstimate, float cUf) {
   Calculo &k = calc;
   k.valido = false;
   if (V <= 0.0f || I <= 0.0f) return;
@@ -267,50 +249,54 @@ void calcularTriangulos(float V, float I, float P, bool inductiva, float cUf) {
   k.V = V; k.Imed = I; k.P = P;
   k.Smed = V * I;
   k.FPmed = P / k.Smed;
-  if (k.FPmed > 1.0f) k.FPmed = 1.0f;
-  float thMedRad = acos(k.FPmed) * (inductiva ? 1.0f : -1.0f);   // θ = ± arccos(FP)
-  k.thMed = aGrados(thMedRad);
-  float Qmed = k.Smed * sin(thMedRad);                            // Q = S·sen θ
+  float nonactive = sqrt(max(0.0f, (k.Smed - fabsf(P)) * (k.Smed + fabsf(P))));
+  k.Qmed = constrain(qEstimate, -nonactive, nonactive);
+  k.measuredResidual = sqrt(max(0.0f, (nonactive - fabsf(k.Qmed)) * (nonactive + fabsf(k.Qmed))));
+  // En la simulación, el equivalente sinusoidal conserva P y S de entrada.
+  // La cuadratura aporta el signo. Su magnitud y el residuo quedan como diagnóstico.
+  k.residual = SIMULATED_BANK ? 0.0f : k.measuredResidual;
 
   // 2) Carga sola. Con banco SIMULADO la medición ya es la del motor solo; con banco
   //    real la medición incluye los capacitores y se les quita su Qc = ωCV².
   k.C = cUf;
   k.Bc = OMEGA * cUf * 1e-6f;                                    // Bc = ωC
   k.Qc = k.Bc * V * V;                                           // Qc = ωC·V²
-  k.Q0 = SIMULATED_BANK ? Qmed : Qmed + k.Qc;
-  k.S0 = sqrt(P * P + k.Q0 * k.Q0);                              // S = √(P² + Q²)
-  k.FP0 = P / k.S0;                                              // FP = P/S
+  k.Q0 = SIMULATED_BANK ? (qEstimate < 0.0f ? -nonactive : nonactive) : k.Qmed + k.Qc;
+  k.S0 = apparentPower(P, k.Q0, k.residual);
+  k.FP0 = k.S0 > 0.0f ? P / k.S0 : 0.0f;
   float th0Rad = atan2(k.Q0, P);                                 // θ (tan θ = Q/P)
   k.th0 = aGrados(th0Rad);
   k.I0 = k.S0 / V;                                               // I = S/V
 
-  // 3) Triángulo de impedancia:  |Z| = V/I ,  R = |Z|cos θ ,  X = |Z|sen θ
-  k.Z = V / k.I0;
+  // 3) Impedancia equivalente de terminales, a partir de P + jQ.
+  float sPQ = apparentPower(P, k.Q0, 0.0f);
+  k.Z = sPQ > 0.0f ? V * V / sPQ : 0.0f;
   k.R = k.Z * cos(th0Rad);
   k.X = k.Z * sin(th0Rad);
 
   // 4) Admitancia:  Y = 1/Z = G − jB
-  k.G = k.R / (k.Z * k.Z);
-  k.B = k.X / (k.Z * k.Z);
+  k.G = P / (V * V);
+  k.B = k.Q0 / (V * V);
 
   // 6) Capacitor en paralelo suma +jωC:  Y' = G − j(B − ωC)
   k.Bn = k.B - k.Bc;
-  k.Yn = sqrt(k.G * k.G + k.Bn * k.Bn);                          // |Y'|
-  k.FP = k.G / k.Yn;                                             // FP' = G/|Y'| = cos θ'
+  k.Qn = k.Q0 - k.Qc;
+  k.Sn = apparentPower(P, k.Qn, k.residual);
+  k.FP = k.Sn > 0.0f ? P / k.Sn : 0.0f;
   k.th = aGrados(atan2(k.Bn, k.G));
-  k.In = V * k.Yn;                                               // I' = V·|Y'|
-  k.Sn = V * k.In;                                               // S' = V·I'
-  k.Qn = V * V * k.Bn;                                           // Q' = V²(B − ωC)
+  k.In = k.Sn / V;
 
-  // 7) Corrección requerida para FP_TARGET_MIN:  Qc = P(tan θ1 − tan θ2) ,  C = Qc/(ωV²)
-  k.tan1 = k.Q0 / P;
+  // 7) Ajuste adicional desde el estado actual hasta el borde más cercano de la meta.
   k.tan2 = tan(acos(FP_TARGET_MIN));
-  k.Qreq = P * (k.tan1 - k.tan2);
+  float qLimitSq = P * P * k.tan2 * k.tan2 - k.residual * k.residual;
+  k.correctionReachable = P > 0.0f && qLimitSq >= 0.0f;
+  float qLimit = sqrt(max(0.0f, qLimitSq));
+  k.Qreq = k.correctionReachable ? k.Qn - constrain(k.Qn, -qLimit, qLimit) : 0.0f;
   k.Creq = k.Qreq / (OMEGA * V * V) * 1e6f;
-  k.C1 = k.B / OMEGA * 1e6f;                                     // FP = 1:  C = B/ω
+  k.C1 = k.B / OMEGA * 1e6f;                                     // C para anular Q de la carga
 
-  // 8) Verificación: FP = cos(θv − θi) con el ángulo medido entre v(t) e i(t)
-  k.thVI = lastThetaValid ? lastThetaRawDeg : k.thMed;
+  // 8) Indicador de desplazamiento aproximado por cuadratura.
+  k.thVI = lastThetaRawDeg;
   k.FPvi = cos(k.thVI * PI / 180.0f);
   k.valido = true;
 }
@@ -324,20 +310,20 @@ void imprimirMemoria() {
   Serial.print(F("   S = Vrms*Irms = ")); Serial.print(k.V, 1); Serial.print(F(" * ")); Serial.print(k.Imed, 3);
   Serial.print(F(" = ")); Serial.print(k.Smed, 1); Serial.println(F(" VA"));
   Serial.print(F("2) Carga sola: FP = P/S = ")); Serial.print(k.P, 1); Serial.print('/'); Serial.print(k.S0, 1);
-  Serial.print(F(" = ")); Serial.print(k.FP0, 3); Serial.print(F("   theta = arccos(FP) = ")); Serial.print(k.th0, 1); Serial.println(F(" deg"));
-  Serial.print(F("   Q = S*sen(theta) = ")); Serial.print(k.Q0, 1); Serial.print(F(" var   I = S/V = ")); Serial.print(k.I0, 3); Serial.println(F(" A"));
-  Serial.print(F("3) |Z| = V/I = ")); Serial.print(k.Z, 2); Serial.print(F(" ohm   R = |Z|cos = ")); Serial.print(k.R, 2);
-  Serial.print(F("   X = |Z|sen = ")); Serial.print(k.X, 2); Serial.print(F("   R/|Z| = ")); Serial.println(k.R / k.Z, 3);
+  Serial.print(F(" = ")); Serial.print(k.FP0, 3); Serial.print(F("   atan2(Q,P) = ")); Serial.print(k.th0, 1); Serial.println(F(" deg"));
+  Serial.print(F("   Q del modelo = ")); Serial.print(k.Q0, 1); Serial.print(F(" var   Residuo de adquisicion = ")); Serial.print(k.measuredResidual, 1); Serial.println(F(" VA"));
+  Serial.print(F("3) |Z equivalente| = V^2 / hypot(P,Q) = ")); Serial.print(k.Z, 2);
+  Serial.print(F(" ohm   R = ")); Serial.print(k.R, 2); Serial.print(F("   X = ")); Serial.println(k.X, 2);
   Serial.print(F("4) Y = 1/Z = G - jB = ")); Serial.print(k.G * 1000.0f, 2); Serial.print(F(" - j")); Serial.print(k.B * 1000.0f, 2); Serial.println(F(" mS"));
   Serial.print(F("5) C = ")); Serial.print(k.C, 1); Serial.print(F(" uF  wC = 377*C = ")); Serial.print(k.Bc * 1000.0f, 2);
   Serial.print(F(" mS   Qc = wC*V^2 = ")); Serial.print(k.Qc, 1); Serial.println(F(" var"));
   Serial.print(F("6) Y' = G - j(B - wC) = ")); Serial.print(k.G * 1000.0f, 2); Serial.print(F(" - j")); Serial.print(k.Bn * 1000.0f, 2);
-  Serial.print(F(" mS  FP' = G/|Y'| = ")); Serial.print(k.FP, 3); Serial.print(k.Bn >= 0 ? F(" (atraso)") : F(" (adelanto)"));
-  Serial.print(F("  I' = V|Y'| = ")); Serial.print(k.In, 3); Serial.print(F(" A  Q' = Q - Qc = ")); Serial.print(k.Qn, 1); Serial.println(F(" var"));
-  Serial.print(F("7) Para FP=")); Serial.print(FP_TARGET_MIN, 2); Serial.print(F(": Qc = P(tan1 - tan2) = ")); Serial.print(k.P, 1);
-  Serial.print(F("*(")); Serial.print(k.tan1, 3); Serial.print(F(" - ")); Serial.print(k.tan2, 3); Serial.print(F(") = ")); Serial.print(k.Qreq, 1);
-  Serial.print(F(" var  ->  C = Qc/(wV^2) = ")); Serial.print(k.Creq, 1); Serial.print(F(" uF   (FP=1: C = B/w = ")); Serial.print(k.C1, 1); Serial.println(F(" uF)"));
-  Serial.print(F("8) Verificacion: FP = cos(theta_v - theta_i) = cos(")); Serial.print(k.thVI, 1); Serial.print(F(" deg) = ")); Serial.println(k.FPvi, 3);
+  Serial.print(F(" mS  FP' = P/S' = ")); Serial.print(k.FP, 3); Serial.print(k.Bn >= 0 ? F(" (atraso)") : F(" (adelanto)"));
+  Serial.print(F("  I' = S'/V = ")); Serial.print(k.In, 3); Serial.print(F(" A  Q' = Q - Qc = ")); Serial.print(k.Qn, 1); Serial.println(F(" var"));
+  Serial.print(F("7) Ajuste para llegar a FP 0.95: "));
+  if (k.correctionReachable) { Serial.print(k.Creq, 1); Serial.println(F(" uF")); }
+  else Serial.println(F("fuera del alcance del modelo capacitivo"));
+  Serial.print(F("8) Factor de desplazamiento estimado: cos(")); Serial.print(k.thVI, 1); Serial.print(F(" deg) = ")); Serial.println(k.FPvi, 3);
   Serial.println(F("=========================================="));
 }
 
@@ -514,101 +500,71 @@ void pruebaLED() {
   for (uint8_t i = 0; i < NUM_STEPS; i++) digitalWrite(LED_PIN[i], LOW);
 }
 
-// ---------- Lógica de control automático (0.95 - 0.99) ----------
-int8_t findNextAvailableStepToAdd() {
-  int8_t bestIdx = -1;
-  float minCap = 1e9f;
-  for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    if (!ledEstado[i] && getRemainingLockoutMs(i) == 0 && STEP_CAPACITANCE_UF[i] < minCap) {
-      minCap = STEP_CAPACITANCE_UF[i];
-      bestIdx = (int8_t)i;
-    }
+// ---------- Lógica de control automático (0.95 - 1.00) ----------
+bool runAutoControl(bool hayCarga) {
+  if (!autoMode) {
+    systemStatus = adsAddr ? "MANUAL" : "ADS1115_ERROR";
+    return false;
   }
-  return bestIdx;
-}
-
-int8_t findStepToRemove() {
-  int8_t bestIdx = -1;
-  float minCap = 1e9f;
-  for (uint8_t i = 0; i < NUM_STEPS; i++) {
-    if (ledEstado[i] && STEP_CAPACITANCE_UF[i] < minCap) {
-      minCap = STEP_CAPACITANCE_UF[i];
-      bestIdx = (int8_t)i;
-    }
+  if (!hayCarga || !adsAddr) {
+    bool anyOn = getTotalConnectedCapacitanceUf() > 0.0f;
+    for (uint8_t i = 0; i < NUM_STEPS; i++) setStepState(i, false);
+    systemStatus = !adsAddr ? "ADS1115_ERROR" : (anyOn ? "NO_LOAD_RESET" : "NO_LOAD");
+    return anyOn;
   }
-  return bestIdx;
-}
-
-void runAutoControl(bool hayV, bool hayI, float fp) {
-  if (!adsAddr) { systemStatus = "ADS1115_ERROR"; return; }
-  if (!autoMode) { systemStatus = "MANUAL"; return; }
-
-  if (!hayV || !hayI) {
-    bool anyOn = false;
-    for (uint8_t i = 0; i < NUM_STEPS; i++) {
-      if (ledEstado[i]) { setStepState(i, false); anyOn = true; }
-    }
-    awaitingStepCheck = false;
-    systemStatus = anyOn ? "NO_LOAD_RESET" : "NO_LOAD";
-    return;
+  if (!calc.valido || calc.P <= 0.0f) {
+    systemStatus = "INVALID_POWER";
+    return false;
   }
-
-  if ((millis() - lastSwitchMs) < MIN_SWITCH_INTERVAL_MS) {
+  if (millis() - lastSwitchMs < MIN_SWITCH_INTERVAL_MS) {
     systemStatus = "SETTLING";
-    return;
+    return false;
   }
-
-  if (awaitingStepCheck && lastAddedStep >= 0) {
-    awaitingStepCheck = false;
-    if (fp < fpBeforeStep) {
-      setStepState((uint8_t)lastAddedStep, false);
-      lastAddedStep = -1;
-      systemStatus = "OVERCOMP_REVERT";
-      return;
-    }
-    lastAddedStep = -1;
-  }
-
-  if (fp < FP_TARGET_MIN) {
-    int8_t nextStep = findNextAvailableStepToAdd();
-    if (nextStep >= 0) {
-      fpBeforeStep = fp;
-      if (setStepState((uint8_t)nextStep, true)) {
-        lastAddedStep = nextStep;
-        awaitingStepCheck = true;
-        systemStatus = "STEP_ADDED";
-      }
-    } else {
-      systemStatus = "MAX_CAP_OR_LOCKED";
-    }
-  } else if (fp > FP_TARGET_MAX) {
-    int8_t remStep = findStepToRemove();
-    if (remStep >= 0) {
-      setStepState((uint8_t)remStep, false);
-      systemStatus = "STEP_REMOVED";
-    } else {
-      systemStatus = "IN_RANGE";
-    }
-  } else {
+  if (calc.FP >= FP_TARGET_MIN) {
     systemStatus = "IN_RANGE";
+    return false;
   }
+
+  const bool add = calc.Qn > 0.0f;
+  int8_t best = -1;
+  float bestFP = calc.FP;
+  bool locked = false;
+  for (uint8_t i = 0; i < NUM_STEPS; i++) {
+    if (ledEstado[i] == add) continue;
+    float deltaQ = OMEGA * STEP_CAPACITANCE_UF[i] * 1e-6f * calc.V * calc.V;
+    float candidateQ = calc.Qn + (add ? -deltaQ : deltaQ);
+    float candidateFP = calc.P / apparentPower(calc.P, candidateQ, calc.residual);
+    if (candidateFP <= bestFP ||
+        (candidateFP < FP_TARGET_MIN && candidateFP - calc.FP < FP_MIN_IMPROVEMENT)) continue;
+    if (add && getRemainingLockoutMs(i) > 0) {
+      locked = true;
+      continue;
+    }
+    bestFP = candidateFP;
+    best = (int8_t)i;
+  }
+  if (best < 0) {
+    systemStatus = locked ? "STEP_LOCKED" : "TARGET_UNREACHABLE";
+    return false;
+  }
+  setStepState((uint8_t)best, add);
+  systemStatus = add ? "STEP_ADDED" : "STEP_REMOVED";
+  return true;
 }
 
 // ---------- Comandos Serial ----------
 void processCommand(const char* cmd) {
   if (strcmp(cmd, "MODE:AUTO") == 0) {
     autoMode = true;
-    awaitingStepCheck = false;
   } else if (strcmp(cmd, "MODE:MANUAL") == 0) {
     autoMode = false;
-    awaitingStepCheck = false;
   } else if (strcmp(cmd, "0") == 0) {
     autoMode = false;
     for (uint8_t i = 0; i < NUM_STEPS; i++) setStepState(i, false, true);
   } else if (strcmp(cmd, "1") == 0 || strcmp(cmd, "2") == 0 || strcmp(cmd, "3") == 0) {
     uint8_t idx = (uint8_t)(cmd[0] - '1');
     autoMode = false;
-    setStepState(idx, !ledEstado[idx], true);
+    setStepState(idx, !ledEstado[idx]);
   } else if (strcmp(cmd, "l") == 0 || strcmp(cmd, "L") == 0) {
     autoMode = false;
     pruebaLED();
@@ -627,24 +583,27 @@ void processCommand(const char* cmd) {
   } else if (strncmp(cmd, "PH:", 3) == 0) {
     fijarFase(atol(cmd + 3));
   } else if (strncmp(cmd, "CAL:", 4) == 0) {
-    float fpRef = (float)atof(cmd + 4);
-    if (fpRef <= 0.0f || fpRef > 1.0f) {
+    char* end;
+    float fpRef = (float)strtod(cmd + 4, &end);
+    if (*end != '\0' || fpRef != 1.0f) {
       calMsg = "CAL_VALOR_INVALIDO";
+    } else if (autoMode || getTotalConnectedCapacitanceUf() > 0.0f) {
+      calMsg = "CAL_APAGAR_BANCO";
     } else if (!lastThetaValid) {
-      calMsg = "CAL_SIN_CARGA";      // hace falta V e I presentes para calibrar
+      calMsg = "CAL_SIN_CARGA";
     } else {
-      // Error de ángulo que queda con el retardo actual. Se prueban las dos polaridades
-      // del SCT y se elige la de menor error. Luego se pasa a us (1 grado = 46.3 us a 60 Hz).
-      float refDeg = acos(fpRef) * 180.0f / PI;
-      float errMisma = envolverGrados(lastThetaRawDeg - refDeg);
-      float errInvertida = envolverGrados(lastThetaRawDeg + 180.0f - refDeg);
-      float errDeg = errMisma;
-      if (fabs(errInvertida) < fabs(errMisma)) {
-        polaridadI = -polaridadI;
-        errDeg = errInvertida;
+      float errMisma = envolverGrados(lastThetaRawDeg);
+      float errInvertida = envolverGrados(lastThetaRawDeg + 180.0f);
+      bool invertir = fabs(errInvertida) < fabs(errMisma);
+      float errDeg = invertir ? errInvertida : errMisma;
+      long ajuste = (long)phaseDelayUs + lroundf(errDeg * (1e6f / (360.0f * 60.0f)));
+      if (ajuste < PHASE_DELAY_MIN_US || ajuste > PHASE_DELAY_MAX_US) {
+        calMsg = "CAL_FUERA_RANGO";
+      } else {
+        if (invertir) polaridadI = -polaridadI;
+        fijarFase(ajuste);
+        calMsg = "CAL_OK";
       }
-      fijarFase((long)phaseDelayUs + (long)(errDeg * (1e6f / (360.0f * 60.0f))));
-      calMsg = "CAL_OK";
     }
   } else if (strncmp(cmd, "STEP:", 5) == 0) {
     int idx = -1, val = 0;
@@ -767,7 +726,7 @@ void loop() {
       pendingAds = false;
     }
 
-    if (adsAddr && !adsFalla && (uint32_t)(micros() - tAds) >= 1200) {
+    if (adsAddr && !adsFalla && !pendingAds && (uint32_t)(micros() - tAds) >= 1200) {
       int16_t raw;
       if (adsLeerContinuo(raw)) {
         uint32_t tRead = micros();
@@ -817,58 +776,61 @@ void loop() {
   float iScale = (1.0f / 1000.0f) / R_CARGA_OHM * RELACION_SCT * FACTOR_CORR_I;
   float irms = hayI ? iRmsMv * iScale : 0.0f;
 
-  // ---------- Potencia activa medida y signo del desfase ----------
-  // P = (1/N)·Σ v·i  (covarianza: v e i sin su componente DC), con v alineado por phaseDelayUs.
-  // El signo de θ = θv − θi sale de cov(v retrasado T/4, i) ~ sen θ  (+ inductiva, − capacitiva).
-  float p = 0.0f, s = vrms * irms, q = 0.0f, fp = 0.0f;
-  bool hayCarga = hayV && hayI && adsOk && s >= 1.0f;
-  bool inductiva = true;
+  // ---------- Potencia activa medida y Q estimada por cuadratura ----------
+  float p = 0.0f, sMed = vrms * irms, qEstimate = 0.0f;
+  bool hayCarga = hayV && hayI && adsAddr && sMed >= 1.0f;
   lastThetaValid = false;
   calc.valido = false;
   if (hayCarga) {
-    float vScale = NANO_LSB_MV * ZMPT_FACTOR;
-    double covVI = (w.sumVI / w.nA) - (w.sumV / w.nA) * (double)iMedia;
-    float pCalc = fabs((float)(covVI * (double)vScale * (double)iScale)) * PHASE_JITTER_GAIN;
-    if (pCalc > s) pCalc = s;
-    p = pCalc;
-
+    float powerScale = NANO_LSB_MV * ZMPT_FACTOR * iScale * polaridadI;
+    double covVI = w.sumVI / w.nA - (w.sumV / w.nA) * iMedia;
+    p = constrain((float)covVI * powerScale, -sMed, sMed);
     if (w.nQ >= 10) {
       double mI = w.sumIq / w.nQ;
       double cI = w.sumViI / w.nQ - (w.sumVi / w.nQ) * mI;
       double cQ = w.sumVqI / w.nQ - (w.sumVq / w.nQ) * mI;
-      cI *= polaridadI;                       // orientación del SCT (calibrada con CAL)
-      cQ *= polaridadI;
-      lastThetaRawDeg = (float)(atan2(cQ, cI) * 180.0 / PI);   // θv − θi medido
+      lastThetaRawDeg = aGrados(atan2(cQ * polaridadI, cI * polaridadI));
       lastThetaValid = true;
-      inductiva = (cQ >= 0);
+      qEstimate = (float)cQ * powerScale;
+      calcularTriangulos(vrms, irms, p, qEstimate, getTotalConnectedCapacitanceUf());
     }
-
-    // ---------- Triángulos de potencias, impedancia y admitancia + banco ----------
-    calcularTriangulos(vrms, irms, p, inductiva, getTotalConnectedCapacitanceUf());
-
-    // Valores que se reportan = sistema con el banco conectado (paso 6 de la memoria)
-    s = calc.Sn;
-    irms = calc.In;
-    q = calc.Qn;
-    fp = calc.FP;
-    inductiva = (calc.Bn >= 0.0f);
   }
 
-  runAutoControl(hayV, hayCarga, hayCarga ? fp : 1.0f);
+  if (SIMULATED_BANK && runAutoControl(hayCarga) && calc.valido) {
+    calcularTriangulos(vrms, irms, p, qEstimate, getTotalConnectedCapacitanceUf());
+  }
+  // Los campos originales siguen describiendo el sistema con el banco.
+  float fpMed = hayCarga ? p / sMed : 0.0f;
+  float s = SIMULATED_BANK && calc.valido ? calc.Sn : sMed;
+  float iSystem = SIMULATED_BANK && calc.valido ? calc.In : irms;
+  float q = calc.valido ? (SIMULATED_BANK ? calc.Qn : calc.Qmed) : 0.0f;
+  float fp = SIMULATED_BANK && calc.valido ? calc.FP : fpMed;
+  bool inductiva = q >= 0.0f;
 
   // ---------- Salida ----------
   if (jsonMode) {
     Serial.print(F("{\"t\":"));       Serial.print(millis());
     Serial.print(F(",\"vrms\":"));   Serial.print(vrms, 2);
-    Serial.print(F(",\"irms\":"));   Serial.print(irms, 3);
+    Serial.print(F(",\"irms\":"));   Serial.print(iSystem, 3);
     Serial.print(F(",\"p\":"));      Serial.print(p, 1);
     Serial.print(F(",\"q\":"));      Serial.print(q, 1);
     Serial.print(F(",\"s\":"));      Serial.print(s, 1);
     Serial.print(F(",\"fp\":"));     Serial.print(fp, 3);
+    Serial.print(F(",\"bank_simulated\":")); Serial.print(SIMULATED_BANK ? F("true") : F("false"));
+    Serial.print(F(",\"irms_measured\":")); Serial.print(irms, 3);
+    Serial.print(F(",\"s_measured\":")); Serial.print(sMed, 1);
+    Serial.print(F(",\"fp_measured\":"));
+    if (hayCarga) Serial.print(fpMed, 4); else Serial.print(F("null"));
+    Serial.print(F(",\"q_estimated\":"));
+    if (calc.valido) Serial.print(calc.Qmed, 1); else Serial.print(F("null"));
+    Serial.print(F(",\"irms_compensated\":"));
+    if (calc.valido && SIMULATED_BANK) Serial.print(calc.In, 3); else Serial.print(F("null"));
+    Serial.print(F(",\"fp_compensated\":"));
+    if (calc.valido && SIMULATED_BANK) Serial.print(calc.FP, 4); else Serial.print(F("null"));
     Serial.print(F(",\"freq\":"));   Serial.print(freq, 1);
     Serial.print(F(",\"phase_us\":")); Serial.print(phaseDelayUs);
     Serial.print(F(",\"carga\":\""));
-    Serial.print(!hayCarga ? F("-") : (inductiva ? F("IND") : F("CAP")));
+    Serial.print(!calc.valido ? F("-") : (inductiva ? F("IND") : F("CAP")));
     Serial.print('"');
     if (calMsg[0]) {
       Serial.print(F(",\"cal\":\"")); Serial.print(calMsg); Serial.print('"');
@@ -904,10 +866,14 @@ void loop() {
       Serial.print(F(",\"qc\":"));   Serial.print(calc.Qc, 1);
       Serial.print(F(",\"bn\":"));   Serial.print(calc.Bn * 1000.0f, 3);
       Serial.print(F(",\"th\":"));   Serial.print(calc.th, 1);
-      Serial.print(F(",\"t1\":"));   Serial.print(calc.tan1, 3);
+      Serial.print(F(",\"residual\":")); Serial.print(calc.residual, 1);
+      Serial.print(F(",\"residual_measured\":")); Serial.print(calc.measuredResidual, 1);
+      Serial.print(F(",\"sinusoidal_model\":")); Serial.print(SIMULATED_BANK ? F("true") : F("false"));
       Serial.print(F(",\"t2\":"));   Serial.print(calc.tan2, 3);
-      Serial.print(F(",\"qr\":"));   Serial.print(calc.Qreq, 1);
-      Serial.print(F(",\"cr\":"));   Serial.print(calc.Creq, 1);
+      Serial.print(F(",\"qr\":"));
+      if (calc.correctionReachable) Serial.print(calc.Qreq, 1); else Serial.print(F("null"));
+      Serial.print(F(",\"cr\":"));
+      if (calc.correctionReachable) Serial.print(calc.Creq, 1); else Serial.print(F("null"));
       Serial.print(F(",\"c1\":"));   Serial.print(calc.C1, 1);
       Serial.print(F(",\"thvi\":")); Serial.print(calc.thVI, 1);
       Serial.print(F(",\"fpvi\":")); Serial.print(calc.FPvi, 3);
@@ -919,10 +885,14 @@ void loop() {
   } else {
     Serial.print('#'); pf((float)numero, 5, 0);
     Serial.print(F(" | V ")); pf(vrms, 6, 1); Serial.print(F(" Vrms"));
-    Serial.print(F(" | I ")); pf(irms, 5, 2); Serial.print(F(" Arms"));
+    Serial.print(F(" | I medida ")); pf(irms, 5, 2); Serial.print(F(" Arms"));
     Serial.print(F(" | P ")); pf(p, 6, 1); Serial.print(F(" W"));
-    Serial.print(F(" | FP ")); pf(fp, 5, 3);
-    Serial.print(!hayCarga ? F(" -") : (inductiva ? F(" IND") : F(" CAP")));
+    Serial.print(F(" | FP medido ")); pf(fpMed, 5, 3);
+    if (SIMULATED_BANK && calc.valido) {
+      Serial.print(F(" | I / FP estimados ")); pf(iSystem, 5, 2);
+      Serial.print(F(" A / ")); pf(fp, 5, 3);
+    }
+    Serial.print(!calc.valido ? F(" -") : (inductiva ? F(" IND") : F(" CAP")));
     Serial.print(F(" | ph=")); Serial.print(phaseDelayUs); Serial.print(F("us"));
     if (calMsg[0]) { Serial.print(F(" | ")); Serial.print(calMsg); calMsg = ""; }
     Serial.print(F(" | ")); Serial.println(systemStatus);
@@ -935,4 +905,6 @@ void loop() {
       Serial.print(F(" SCT=")); Serial.println(w.nA);
     }
   }
+  if (!SIMULATED_BANK) runAutoControl(hayCarga);
 }
+

@@ -6,7 +6,7 @@ Genera 4 gráficas en alta resolución (300 DPI) numeradas secuencialmente
 (Prueba_1, Prueba_2, ...) para no confundir los registros entre pruebas:
   1. Prueba_N_fp_y_corriente.png      -> FP, Irms y capacitancia activa en el tiempo
   2. Prueba_N_modelo_vs_medicion.png  -> FP medido vs modelo Python y error (%) < 4%
-  3. Prueba_N_compensacion_carga.png  -> Motor WEG 0.5 HP (0%-100%): sin compensar vs compensado
+  3. Prueba_N_compensacion_carga.png  -> Escenarios WEG (0%-100%): sin compensar vs compensado
   4. Prueba_N_descarga_rc.png         -> Curvas de descarga RC (100 kOhm) hasta < 50 V
 
 Uso:
@@ -16,6 +16,7 @@ Uso:
 
 import argparse
 import csv
+import math
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -28,15 +29,18 @@ import numpy as np
 from powerguard_model import (
     DEFAULT_BANK_STEPS_UF,
     DEFAULT_DISCHARGE_R_OHMS,
-    DEFAULT_FREQ_HZ,
+    DEFAULT_FP_MAX,
+    DEFAULT_FP_TARGET,
     DEFAULT_VOLTAGE_V,
+    REFERENCE_VOLTAGE_V,
     WEG_MOTOR_POINTS,
+    best_bank_combination,
     discharge_voltage,
     measurement_error_pct,
-    predict_compensated_state,
     simulate_all_bank_combinations,
     time_to_safe_voltage,
 )
+from validate_measurements import compare_csv_row
 
 
 def detect_next_prueba_name(out_dir: Path) -> str:
@@ -57,29 +61,25 @@ def load_csv_rows(csv_path: Path) -> List[Dict[str, float]]:
         reader = csv.DictReader(f)
         for idx, r in enumerate(reader):
             vrms = float(r.get("vrms") or DEFAULT_VOLTAGE_V)
-            irms = float(r.get("irms") or 0.0)
+            source, fp, reference = compare_csv_row(r)
+            raw_current = r.get("irms_measured") if source == "arduino" else r.get("irms")
+            irms = float(raw_current) if raw_current not in (None, "") else math.nan
             p_w = float(r.get("p_w") or 0.0)
-            fp_meas = float(r.get("fp_measured") or 0.0)
             cap_uf = float(r.get("cap_uf") or 0.0)
             t_s = float(r.get("timestamp_s") or idx * 0.5)
-
-            load_raw = r.get("load_pct", "")
-            if load_raw not in ("", None):
-                pt = min(WEG_MOTOR_POINTS, key=lambda x: abs(x.load_pct - float(load_raw)))
-            else:
-                pt = min(WEG_MOTOR_POINTS, key=lambda x: abs(x.p_in_w - p_w))
-
-            pred = predict_compensated_state(pt.p_in_w, pt.fp_base, cap_uf, vrms, DEFAULT_FREQ_HZ)
-            fp_mod = float(r.get("fp_model") or pred["FP_new"])
-            err = measurement_error_pct(fp_meas, fp_mod)
+            err = measurement_error_pct(fp, reference) if fp is not None and reference else math.nan
+            fp_est = r.get("fp_compensated") if source == "arduino" else None
+            i_est = r.get("irms_compensated") if source == "arduino" else None
 
             rows.append({
                 "t": t_s,
                 "vrms": vrms,
                 "irms": irms,
                 "p_w": p_w,
-                "fp_meas": fp_meas,
-                "fp_mod": fp_mod,
+                "fp_meas": fp if fp is not None else math.nan,
+                "fp_mod": reference if reference is not None else math.nan,
+                "fp_est": float(fp_est) if fp_est not in (None, "") else math.nan,
+                "i_est": float(i_est) if i_est not in (None, "") else math.nan,
                 "error_pct": err,
                 "cap_uf": cap_uf,
             })
@@ -93,10 +93,11 @@ def plot_fp_and_current(rows: List[Dict[str, float]], out_path: Path, title_pref
     cap = [r["cap_uf"] for r in rows]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True)
-    ax1.axhspan(0.95, 0.99, color="#10b981", alpha=0.18, label="Meta FP (0.95 – 0.99)")
-    ax1.axhline(0.95, color="#10b981", linestyle="--", linewidth=1)
-    ax1.axhline(0.99, color="#10b981", linestyle="--", linewidth=1)
-    ax1.plot(t, fp, color="#0284c7", linewidth=2, label="FP medido")
+    ax1.axhspan(DEFAULT_FP_TARGET, DEFAULT_FP_MAX, color="#10b981", alpha=0.18, label="Meta FP (0.95–1.00)")
+    ax1.axhline(DEFAULT_FP_TARGET, color="#10b981", linestyle="--", linewidth=1)
+    ax1.plot(t, fp, color="#0284c7", linewidth=2, label="FP registrado según el origen del CSV")
+    if any(math.isfinite(r["fp_est"]) for r in rows):
+        ax1.plot(t, [r["fp_est"] for r in rows], color="#7c3aed", linestyle="--", label="FP estimado con banco")
     ax1.set_ylabel("Factor de Potencia")
     ax1.set_ylim(0.2, 1.05)
     ax1.grid(True, alpha=0.3)
@@ -104,6 +105,8 @@ def plot_fp_and_current(rows: List[Dict[str, float]], out_path: Path, title_pref
     ax1.set_title(f"{title_prefix} · Evolución de Factor de Potencia, Corriente y Capacitancia")
 
     ax2.plot(t, irms, color="#d97706", linewidth=2, label="Corriente Irms (A)")
+    if any(math.isfinite(r["i_est"]) for r in rows):
+        ax2.plot(t, [r["i_est"] for r in rows], color="#7c3aed", linestyle="--", label="Corriente estimada con banco")
     ax2.set_ylabel("Corriente RMS (A)", color="#d97706")
     ax2.set_xlabel("Tiempo (s)")
     ax2.grid(True, alpha=0.3)
@@ -129,7 +132,7 @@ def plot_model_vs_measured(rows: List[Dict[str, float]], out_path: Path, title_p
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True)
     ax1.plot(t, fp_mod, color="#0f172a", linewidth=2, linestyle="--", label="FP Modelo Python")
-    ax1.plot(t, fp_meas, color="#0284c7", linewidth=1.8, label="FP Medido")
+    ax1.plot(t, fp_meas, color="#0284c7", linewidth=1.8, label="FP registrado según el origen del CSV")
     ax1.set_ylabel("Factor de Potencia")
     ax1.set_ylim(0.2, 1.05)
     ax1.grid(True, alpha=0.3)
@@ -152,14 +155,13 @@ def plot_model_vs_measured(rows: List[Dict[str, float]], out_path: Path, title_p
 def plot_load_compensation(out_path: Path, title_prefix: str) -> None:
     loads = [f"{pt.load_pct}%" for pt in WEG_MOTOR_POINTS]
     fp_base = [pt.fp_base for pt in WEG_MOTOR_POINTS]
-    i_base = [(pt.p_in_w / pt.fp_base) / DEFAULT_VOLTAGE_V for pt in WEG_MOTOR_POINTS]
+    i_base = [(pt.p_in_w / pt.fp_base) / REFERENCE_VOLTAGE_V for pt in WEG_MOTOR_POINTS]
 
     fp_comp = []
     i_comp = []
     for pt in WEG_MOTOR_POINTS:
         combos = simulate_all_bank_combinations(pt, DEFAULT_BANK_STEPS_UF)
-        valid = [c for c in combos if c["en_rango_095_099"]]
-        best = valid[0] if valid else min(combos, key=lambda x: abs(x["FP_pred"] - 0.97))
+        best = best_bank_combination(combos)
         fp_comp.append(best["FP_pred"])
         i_comp.append(best["I_rms_a"])
 
@@ -169,10 +171,10 @@ def plot_load_compensation(out_path: Path, title_prefix: str) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.8))
     ax1.bar(x - width / 2, fp_base, width, color="#94a3b8", label="Sin compensar")
     ax1.bar(x + width / 2, fp_comp, width, color="#10b981", label="Compensado (Banco)")
-    ax1.axhspan(0.95, 0.99, color="#10b981", alpha=0.15)
+    ax1.axhspan(DEFAULT_FP_TARGET, DEFAULT_FP_MAX, color="#10b981", alpha=0.15)
     ax1.set_xticks(x)
     ax1.set_xticklabels(loads)
-    ax1.set_xlabel("Carga del motor WEG 0.5 HP")
+    ax1.set_xlabel("Escenario de carga del motor WEG a 118 V")
     ax1.set_ylabel("Factor de Potencia")
     ax1.set_ylim(0, 1.08)
     ax1.set_title("Factor de Potencia por Carga")
@@ -183,7 +185,7 @@ def plot_load_compensation(out_path: Path, title_prefix: str) -> None:
     ax2.bar(x + width / 2, i_comp, width, color="#0284c7", label="Compensado (Banco)")
     ax2.set_xticks(x)
     ax2.set_xticklabels(loads)
-    ax2.set_xlabel("Carga del motor WEG 0.5 HP")
+    ax2.set_xlabel("Escenario de carga del motor WEG a 118 V")
     ax2.set_ylabel("Corriente RMS (A)")
     ax2.set_title("Reducción de Corriente en Conductores")
     ax2.grid(True, axis="y", alpha=0.3)

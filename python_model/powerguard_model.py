@@ -8,7 +8,7 @@ Implementa las fórmulas de clase y de la propuesta (Semana 14):
 - Compensación reactiva: Qc = P * (tan(phi_1) - tan(phi_2)), C = Qc / (w * V^2)
 - Descarga RC de capacitores: V(t) = V0 * exp(-t / (R * C))
 - Error porcentual: error(%) = |FP_medido - FP_calculado| / FP_calculado * 100
-- Predicción del FP para las 16 combinaciones del banco de 4 pasos (J1-J4).
+- Predicción del FP para las ocho combinaciones del banco de tres pasos.
 """
 
 from dataclasses import dataclass
@@ -20,35 +20,53 @@ from typing import Dict, List, Tuple
 DEFAULT_VOLTAGE_V = 120.0
 DEFAULT_FREQ_HZ = 60.0
 DEFAULT_FP_TARGET = 0.95
-DEFAULT_FP_MAX = 0.99
+DEFAULT_FP_MAX = 1.0
 DEFAULT_DISCHARGE_R_OHMS = 100_000.0  # R9-R12 = 100 kOhm
+REFERENCE_VOLTAGE_V = 118.0
+MOTOR_RATED_OUTPUT_W = 367.75  # 0.5 CV, dato aportado para el proyecto
+FP_MIN_IMPROVEMENT = 0.005
 
-# Pasos del banco físico validado (3 pasos: 20 uF, 30 uF, 80 uF -> total 130 uF)
-DEFAULT_BANK_STEPS_UF: Tuple[float, float, float] = (20.0, 30.0, 80.0)
+# Banco simulado por los tres LEDs del prototipo.
+DEFAULT_BANK_STEPS_UF: Tuple[float, float, float] = (60.0, 60.0, 60.0)
 
 
 @dataclass(frozen=True)
 class MotorOperatingPoint:
-    """Punto de operación del motor monofásico WEG 0.5 HP (Tabla 6 de la propuesta)."""
+    """Escenario de simulación del motor WEG."""
     load_pct: int
     p_out_w: float
-    efficiency_pct: float
     fp_base: float
     p_in_w: float
 
+    @property
+    def efficiency_pct(self) -> float | None:
+        return motor_efficiency_pct(self.p_in_w, self.p_out_w)
 
-# Datos de placa (WEG 0.5 HP, 4 polos, 60 Hz, 110/220 V) y Tabla 6 de la propuesta
+    @property
+    def losses_w(self) -> float:
+        return self.p_in_w - self.p_out_w
+
+
+def motor_efficiency_pct(p_in_w: float, p_out_w: float | None) -> float | None:
+    """Calcula la eficiencia cuando se conoce la potencia útil del eje."""
+    if p_out_w is None or not 0 <= p_out_w <= p_in_w or p_in_w <= 0:
+        return None
+    return 100.0 * p_out_w / p_in_w
+
+
+# Vacío: escenario de referencia a 118 V, 8.10 A y FP supuesto de 0.20.
+# Carga: Pin y FP de la propuesta; Pout proporcional a carga para la simulación.
 WEG_MOTOR_POINTS: List[MotorOperatingPoint] = [
-    MotorOperatingPoint(load_pct=0,   p_out_w=60.00,  efficiency_pct=0.0,  fp_base=0.20, p_in_w=60.0),  # en vacío: FP medido 0.20
-    MotorOperatingPoint(load_pct=25,  p_out_w=93.25,  efficiency_pct=38.0, fp_base=0.35, p_in_w=245.4),
-    MotorOperatingPoint(load_pct=50,  p_out_w=186.50, efficiency_pct=47.2, fp_base=0.43, p_in_w=395.1),
-    MotorOperatingPoint(load_pct=75,  p_out_w=279.75, efficiency_pct=55.3, fp_base=0.51, p_in_w=505.9),
-    MotorOperatingPoint(load_pct=100, p_out_w=373.00, efficiency_pct=59.5, fp_base=0.59, p_in_w=626.9),
+    MotorOperatingPoint(0, 0.0, 0.20, REFERENCE_VOLTAGE_V * 8.10 * 0.20),
+    MotorOperatingPoint(25, MOTOR_RATED_OUTPUT_W * 0.25, 0.35, 245.4),
+    MotorOperatingPoint(50, MOTOR_RATED_OUTPUT_W * 0.50, 0.43, 395.1),
+    MotorOperatingPoint(75, MOTOR_RATED_OUTPUT_W * 0.75, 0.51, 505.9),
+    MotorOperatingPoint(100, MOTOR_RATED_OUTPUT_W, 0.59, 626.9),
 ]
 
 
 def fp_from_phase_delay(dt_seconds: float, freq_hz: float = DEFAULT_FREQ_HZ) -> Tuple[float, float]:
-    """Calcula el ángulo de desfase (grados) y el FP a partir de dt (método osciloscopio)."""
+    """Calcula el ángulo y el factor de desplazamiento a partir de dt."""
     phi_deg = 360.0 * freq_hz * dt_seconds
     fp = math.cos(math.radians(phi_deg))
     return phi_deg, fp
@@ -69,22 +87,32 @@ def required_compensation(
     fp_target: float = DEFAULT_FP_TARGET,
     v_rms: float = DEFAULT_VOLTAGE_V,
     freq_hz: float = DEFAULT_FREQ_HZ,
+    *,
+    inductive: bool = True,
 ) -> Dict[str, float]:
     """
     Calcula la potencia reactiva Qc (var) y capacitancia C (uF) necesarias
     para llevar una carga de FP inicial a FP objetivo.
     """
-    phi1 = math.acos(max(0.01, min(1.0, fp_initial)))
-    phi2 = math.acos(max(0.01, min(1.0, fp_target)))
-    qc_var = p_w * (math.tan(phi1) - math.tan(phi2))
+    phi1 = math.acos(fp_initial) * (1 if inductive else -1)
+    phi2 = math.acos(fp_target)
+    q_load = p_w * math.tan(phi1)
+    qc_var = reactive_adjustment(q_load, p_w * math.tan(phi2)) or 0.0
     omega = 2.0 * math.pi * freq_hz
-    c_farads = qc_var / (omega * (v_rms ** 2))
+    c_farads = qc_var / (omega * v_rms ** 2) if v_rms > 0 and omega > 0 else 0.0
     return {
         "phi1_deg": math.degrees(phi1),
         "phi2_deg": math.degrees(phi2),
         "Qc_var": qc_var,
         "C_uf": c_farads * 1e6,
     }
+
+
+def reactive_adjustment(q_var: float, q_limit_var: float | None) -> float | None:
+    """Reactiva que hay que cancelar para entrar en la banda en atraso o adelanto."""
+    if q_limit_var is None:
+        return None
+    return q_var - max(-q_limit_var, min(q_limit_var, q_var))
 
 
 def capacitor_reactive_power(
@@ -104,17 +132,27 @@ def predict_compensated_state(
     c_uf: float,
     v_rms: float = DEFAULT_VOLTAGE_V,
     freq_hz: float = DEFAULT_FREQ_HZ,
+    *,
+    inductive: bool = True,
 ) -> Dict[str, float]:
     """
     Predice el estado eléctrico resultante tras conectar una capacitancia C (uF)
     en paralelo con una carga inductiva de potencia activa P_in y FP inicial.
     """
-    phi1 = math.acos(max(0.01, min(1.0, fp_initial)))
-    q_load = p_in_w * math.tan(phi1)
+    phi1 = math.acos(fp_initial)
+    q_load = p_in_w * math.tan(phi1) * (1 if inductive else -1)
+    return compensate_reactive_load(p_in_w, q_load, c_uf, v_rms, freq_hz)
+
+
+def compensate_reactive_load(
+    p_in_w: float, q_load: float, c_uf: float, v_rms: float,
+    freq_hz: float = DEFAULT_FREQ_HZ, *, residual_va: float = 0.0,
+) -> Dict[str, float | str]:
+    """Predicción con tensión casi sinusoidal y residuo no activo constante."""
     q_cap = capacitor_reactive_power(c_uf, v_rms, freq_hz)
     q_net = q_load - q_cap  # >0 inductivo (atrasado), <0 capacitivo (adelantado)
-    s_net = math.hypot(p_in_w, q_net)
-    fp_new = p_in_w / s_net if s_net > 0 else 1.0
+    s_net = math.hypot(p_in_w, q_net, residual_va)
+    fp_new = p_in_w / s_net if s_net > 0 else 0.0
     i_new = s_net / v_rms if v_rms > 0 else 0.0
     return {
         "P_w": p_in_w,
@@ -136,53 +174,58 @@ def memoria_de_calculo(
     c_uf: float = 0.0,
     fp_target: float = DEFAULT_FP_TARGET,
     freq_hz: float = DEFAULT_FREQ_HZ,
-) -> Dict[str, float]:
-    """
-    Misma secuencia de fórmulas que calcularTriangulos() del firmware (powerguard_v7.ino),
-    para verificar a mano o en Python los valores que reporta el Arduino.
+    *,
+    q_var: float | None = None,
+    sinusoidal_model: bool = False,
+) -> Dict[str, float | None]:
+    """Reproduce el modelo del firmware para el banco simulado.
 
-      1) S = Vrms·Irms,  FP = P/S,  θ = ±arccos(FP),  Q = S·sen θ
-      3) |Z| = V/I,  R = |Z|cos θ,  X = |Z|sen θ,  FP = R/|Z|
-      4) Y = 1/Z = G − jB,  G = R/|Z|²,  B = X/|Z|²
-      5) Capacitor en paralelo:  Bc = ωC,  Qc = ωCV²
-      6) Y' = G − j(B − ωC),  FP' = G/|Y'|,  I' = V|Y'|,  Q' = V²(B − ωC)
-      7) Qc = P(tan θ1 − tan θ2),  C = Qc/(ωV²);  C ideal (FP = 1) = B/ω
-    Supone banco SIMULADO (la medición es la de la carga sola).
+    El modo sinusoidal reproduce el banco simulado del firmware: usa P y S
+    para la magnitud de Q y la cuadratura, si está disponible, para el signo.
+    Sin ese modo, una Q suministrada conserva el residuo en la predicción.
     """
+    if v_rms <= 0 or i_rms <= 0 or freq_hz <= 0:
+        raise ValueError("Se requieren tensión, corriente y frecuencia positivas.")
     omega = 2.0 * math.pi * freq_hz
     s = v_rms * i_rms
-    fp = min(1.0, p_w / s)
-    theta = math.acos(fp) * (1.0 if inductiva else -1.0)
-    q = s * math.sin(theta)
+    p_w = max(-s, min(s, p_w))
+    fp = p_w / s
+    nonactive = math.sqrt(max(0.0, s ** 2 - p_w ** 2))
+    q = nonactive * (1 if inductiva else -1) if q_var is None else max(-nonactive, min(nonactive, q_var))
+    measured_residual = math.sqrt(max(0.0, (nonactive - abs(q)) * (nonactive + abs(q))))
+    if sinusoidal_model:
+        q = math.copysign(nonactive, q)
+    residual = 0.0 if sinusoidal_model else measured_residual
+    theta = math.atan2(q, p_w)
+    s_displacement = math.hypot(p_w, q)
+    z = v_rms ** 2 / s_displacement if s_displacement else None
+    r = z * math.cos(theta) if z is not None else None
+    x = z * math.sin(theta) if z is not None else None
 
-    z = v_rms / i_rms
-    r = z * math.cos(theta)
-    x = z * math.sin(theta)
-
-    g = r / z ** 2
-    b = x / z ** 2
+    g = p_w / v_rms ** 2
+    b = q / v_rms ** 2
 
     bc = omega * c_uf * 1e-6
-    qc = bc * v_rms ** 2
-
     bn = b - bc
-    yn = math.hypot(g, bn)
-    fp_new = g / yn
-    i_new = v_rms * yn
+    state = compensate_reactive_load(p_w, q, c_uf, v_rms, freq_hz, residual_va=residual)
 
-    tan1 = q / p_w
+    tan1 = q / p_w if p_w else None
     tan2 = math.tan(math.acos(fp_target))
-    q_req = p_w * (tan1 - tan2)
-    c_req_uf = q_req / (omega * v_rms ** 2) * 1e6
+    q_limit_sq = (p_w * tan2) ** 2 - residual ** 2
+    q_limit = math.sqrt(q_limit_sq) if p_w > 0 and q_limit_sq >= 0 else None
+    q_req = reactive_adjustment(state["Q_net_var"], q_limit)
+    c_req_uf = q_req / (omega * v_rms ** 2) * 1e6 if q_req is not None else None
     c_ideal_uf = b / omega * 1e6
 
     return {
         "S_va": s, "FP": fp, "theta_deg": math.degrees(theta), "Q_var": q,
-        "Z_ohm": z, "R_ohm": r, "X_ohm": x, "FP_R_sobre_Z": r / z,
+        "Residual_va": residual,
+        "Residuo_diagnostico_va": measured_residual,
+        "Z_ohm": z, "R_ohm": r, "X_ohm": x, "FP_R_sobre_Z": math.cos(theta) if z else None,
         "G_S": g, "B_S": b,
-        "Bc_S": bc, "Qc_var": qc,
-        "Bn_S": bn, "FP_compensado": fp_new, "theta_compensado_deg": math.degrees(math.atan2(bn, g)),
-        "I_compensada_a": i_new, "S_compensada_va": v_rms * i_new, "Q_compensada_var": v_rms ** 2 * bn,
+        "Bc_S": bc, "Qc_var": state["Q_cap_var"],
+        "Bn_S": bn, "FP_compensado": state["FP_new"], "theta_compensado_deg": math.degrees(math.atan2(bn, g)),
+        "I_compensada_a": state["I_rms_a"], "S_compensada_va": state["S_net_va"], "Q_compensada_var": state["Q_net_var"],
         "P_desde_G_w": v_rms ** 2 * g,
         "tan1": tan1, "tan2": tan2, "Qc_requerida_var": q_req,
         "C_requerida_uf": c_req_uf, "C_ideal_fp1_uf": c_ideal_uf,
@@ -239,7 +282,7 @@ def time_to_safe_voltage(
 def simulate_all_bank_combinations(
     point: MotorOperatingPoint,
     bank_steps_uf: Tuple[float, ...] = DEFAULT_BANK_STEPS_UF,
-    v_rms: float = DEFAULT_VOLTAGE_V,
+    v_rms: float = REFERENCE_VOLTAGE_V,
     freq_hz: float = DEFAULT_FREQ_HZ,
 ) -> List[Dict[str, object]]:
     """
@@ -250,10 +293,7 @@ def simulate_all_bank_combinations(
     for bits in product([0, 1], repeat=len(bank_steps_uf)):
         c_total = sum(b * c for b, c in zip(bits, bank_steps_uf))
         state = predict_compensated_state(point.p_in_w, point.fp_base, c_total, v_rms, freq_hz)
-        in_range = (
-            DEFAULT_FP_TARGET <= state["FP_new"] <= DEFAULT_FP_MAX
-            and state["tipo"] == "ATRASADO"
-        )
+        in_range = DEFAULT_FP_TARGET <= state["FP_new"] <= DEFAULT_FP_MAX
         results.append({
             "steps": "".join(str(b) for b in bits),
             "C_total_uf": round(c_total, 2),
@@ -261,21 +301,28 @@ def simulate_all_bank_combinations(
             "I_rms_a": round(state["I_rms_a"], 3),
             "FP_pred": round(state["FP_new"], 4),
             "tipo": state["tipo"],
-            "en_rango_095_099": in_range,
+            "en_rango": in_range,
         })
     results.sort(key=lambda r: r["C_total_uf"])
     return results
 
 
+def best_bank_combination(combos: List[Dict[str, object]]) -> Dict[str, object]:
+    """Elige la menor capacitancia que alcanza la meta, o el mayor FP disponible."""
+    return next((combo for combo in combos if combo["en_rango"]), None) or max(
+        combos, key=lambda combo: combo["FP_pred"]
+    )
+
+
 def print_report() -> None:
     """Imprime un resumen completo del modelo teórico para verificación del equipo."""
     print("=" * 78)
-    print("POWERGuard - Modelo Teórico del Motor WEG 0.5 HP (120 V, 60 Hz)")
+    print(f"POWERGuard - Escenarios del motor WEG 0.5 CV ({REFERENCE_VOLTAGE_V:g} V, 60 Hz)")
     print("=" * 78)
     print(f"{'Carga':>6} | {'Pin(W)':>7} | {'FP base':>7} | {'Qc req(var)':>11} | {'C req(uF)':>9}")
     print("-" * 55)
     for pt in WEG_MOTOR_POINTS:
-        comp = required_compensation(pt.p_in_w, pt.fp_base, DEFAULT_FP_TARGET)
+        comp = required_compensation(pt.p_in_w, pt.fp_base, v_rms=REFERENCE_VOLTAGE_V)
         print(
             f"{pt.load_pct:>5}% | {pt.p_in_w:>7.1f} | {pt.fp_base:>7.2f} | "
             f"{comp['Qc_var']:>11.1f} | {comp['C_uf']:>9.1f}"
@@ -287,16 +334,18 @@ def print_report() -> None:
         tau = DEFAULT_DISCHARGE_R_OHMS * c_uf * 1e-6
         print(f"  Paso J{idx} ({c_uf:>4.1f} uF): tau = {tau:.2f} s, t(<50V) = {t_safe:.2f} s")
 
-    print("\nCombinaciones válidas en rango [0.95, 0.99] (banco 20 / 30 / 80 uF):")
+    print("\nOcho combinaciones por carga (60 / 60 / 60 uF, meta 0.95–1.00):")
     for pt in WEG_MOTOR_POINTS:
         combos = simulate_all_bank_combinations(pt)
-        valid = [c for c in combos if c["en_rango_095_099"]]
-        best = valid[0] if valid else min(combos, key=lambda x: abs(x["FP_pred"] - 0.97))
+        best = best_bank_combination(combos)
         print(
-            f"  Carga {pt.load_pct:>3}% -> Mejor combinación [{best['steps']}] "
-            f"({best['C_total_uf']:>5.1f} uF): FP = {best['FP_pred']:.3f} ({best['tipo']}), "
-            f"I = {best['I_rms_a']:.2f} A"
+            f"  Carga {pt.load_pct:>3}%: Pout = {pt.p_out_w:.1f} W, "
+            f"pérdidas = {pt.losses_w:.1f} W, eficiencia = {pt.efficiency_pct:.1f}%"
         )
+        for combo in combos:
+            chosen = " <- selección" if combo is best else ""
+            print(f"    {combo['steps']}  {combo['C_total_uf']:5.1f} uF  "
+                  f"FP={combo['FP_pred']:.4f}  {combo['tipo']}  I={combo['I_rms_a']:.2f} A{chosen}")
 
 
 if __name__ == "__main__":
